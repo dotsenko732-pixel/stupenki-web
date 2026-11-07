@@ -3183,7 +3183,7 @@ function notesView() {
   ${topbar("Покажи на консультации")}
   <h1 class="hand">Для специалиста</h1>
   <p class="sub">Сводка для логопеда, учителя или врача: где ребёнок сейчас и что не пошло — с датами. Нужна консультация — нажми «Скопировать всё» внизу и отправь.</p>
-  <section class="part"><h2 class="hand">Сейчас</h2><p>${currentLevels()}</p></section>
+  <section class="part"><h2 class="hand">Сейчас</h2><p>${esc(currentLevels())}</p></section>
   <section class="part"><h2 class="hand">Отметки</h2>
     ${g.length ? `<ul class="notes">${g.map(([what, ds]) => `<li><strong>${esc(what)}</strong><br><span class="hint">${ds.map(humanDate).join(", ")}</span></li>`).join("")}</ul>`
       : `<p class="hint">Пока пусто. Кнопка «Не пошло» под любым упражнением добавляет сюда отметку с датой.</p>`}
@@ -3621,7 +3621,7 @@ function settingsView() {
     </details>
     <button class="btn danger" data-act="reset">${ui.resetArmed ? "Точно стереть всё? Нажми ещё раз" : "Стереть все данные"}</button>
   </section>
-  <p class="hint">«Ступеньки», версия ${"1.7.2"}</p>`;
+  <p class="hint">«Ступеньки», версия ${"1.7.3"}</p>`;
 }
 
 /* =============================================================
