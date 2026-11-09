@@ -3621,7 +3621,7 @@ function settingsView() {
     </details>
     <button class="btn danger" data-act="reset">${ui.resetArmed ? "Точно стереть всё? Нажми ещё раз" : "Стереть все данные"}</button>
   </section>
-  <p class="hint">«Ступеньки», версия ${"1.7.3"}</p>`;
+  <p class="hint">«Ступеньки», версия ${"1.7.4"}</p>`;
 }
 
 /* =============================================================
@@ -4280,7 +4280,13 @@ function again() { ui.talk++; sayNow(say("again")); }
 /* Тренажёр закончен: наклейка, если сегодня за него ещё не было (её покажет wonCard или kidTop) */
 function finished(from) {
   const s = awardSticker(from); if (s) ui.won = s;
-  if (ui.session && ui.session.plan === "stages") planRound(from);   // занятие по ступеням: блок отмечается сам
+  played(from);
+}
+/* Круг сыгран, но последний ход не получился (Муха мимо, последний слог или слово — по буквам):
+   наклейки и «дзыня» нет — их дают только за «получилось», иначе ребёнок видит, что промах награждают.
+   Занимался он всё равно: в занятии по ступеням блок отмечается сам */
+function played(from) {
+  if (ui.session && ui.session.plan === "stages") planRound(from);
 }
 /* Получилось. from — тренажёр закончен: «дзынь» из трёх нот и наклейка */
 function cheer(from) {
@@ -5877,11 +5883,12 @@ function openMerge(mode) {
   renderMerge();
 }
 
-function finish$2() {
+/* Круг закончен. Последний ход не получился (слог снова по буквам) — без наклейки и «дзыня»: их дают за «получилось» */
+function finish$2(lastOk = true) {
   const g = ui.mrg;
   g.end = true;
   logRound(LOG$2[g.mode], g.ok, g.moves.length);
-  cheer("merge");
+  if (lastOk) cheer("merge"); else { ui.talk++; played("merge"); }
 }
 
 /* «Слияние»: родитель отметил. По буквам — ещё раз тот же слог (уже не с первого раза), потом дальше */
@@ -5891,7 +5898,7 @@ function mergeMark(ok) {
   if (!ok && !g.retry) { ui.talk++; Object.assign(g, { first: false, retry: true, yay: false }); renderMerge(); return; }
   if (ok && g.first) g.ok++;
   Object.assign(g, { i: g.i + 1, first: true, retry: false, yay: ok });
-  if (g.i >= g.moves.length) finish$2(); else if (ok) cheer(); else ui.talk++;
+  if (g.i >= g.moves.length) finish$2(ok); else if (ok) cheer(); else ui.talk++;
   renderMerge();
 }
 /* Нажал на слог — согласная подъезжает снова */
@@ -6670,11 +6677,12 @@ function openWordsPhrases(mode) {
   renderWords3();
 }
 
-function finish() {
+/* Круг закончен. Последнее слово прочитано по буквам — без наклейки и «дзыня»: их дают за «получилось» */
+function finish(lastOk = true) {
   const g = ui.wd3;
   g.end = true;
   logRound(LOG[g.mode], g.ok, g.moves.length);
-  cheer("words3");
+  if (lastOk) cheer("words3"); else { ui.talk++; played("words3"); }
 }
 function solved() { const g = ui.wd3; if (g.first) g.ok++; g.solved = true; vibrate(40); cheer(); renderWords3(); }
 function missed(el, key) { const g = ui.wd3; flash(el, "nope"); el.disabled = true; g.off.push(key); g.first = false; again(); }
@@ -6705,7 +6713,7 @@ function words3Mark(v) {
   if (v !== "let") g.ok++;
   if (v === "whole") g.whole++;
   g.i++; g.yay = v !== "let";
-  if (g.i >= g.moves.length) finish(); else if (g.yay) cheer(); else ui.talk++;
+  if (g.i >= g.moves.length) finish(g.yay); else if (g.yay) cheer(); else ui.talk++;
   renderWords3();
 }
 
@@ -7171,7 +7179,7 @@ const ACT = {
     if (ui.fly.levelUp) S.flyLevel++;
     if (ui.fly.levelDown) S.flyLevel--;
     if (S.flyLevel > S.flyBest) S.flyBest = S.flyLevel;
-    if (ok) cheer("fly"); else { ui.talk++; finished("fly"); }   // раунд сыгран — наклейка и за промах: старался
+    if (ok) cheer("fly"); else { ui.talk++; played("fly"); }     // мимо: наклейки нет, но раунд сыгран — блок занятия отмечается
     ui.fly.phase = "result"; save(); vibrate(ok ? 60 : 30); renderFly();
   },
   flyAgain: () => openFly(),
