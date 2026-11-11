@@ -132,6 +132,7 @@ const DEFAULT_STATE = {
   // plan: "stages" | "program" — какое занятие (src/plan.js); нет поля — программа, как было всегда.
   // stageLater: {read: {n, d}, count: {n, d}} — «Пока рано» у подсказки о следующей ступени (src/next-stage.js)
   // check — входная проверка (src/check-data.js): {d, read, count}; поля нет, пока её не проходили
+  // logic: {odd: 2, row: 1, …} — уровни игр «Логики» (src/logic-level.js); поля нет, пока уровень не менялся
 };
 const clone = o => JSON.parse(JSON.stringify(o));
 let S = clone(DEFAULT_STATE);
@@ -179,6 +180,12 @@ function fromData(data) {
   if (!s.stageLater || typeof s.stageLater !== "object" || Array.isArray(s.stageLater)) delete s.stageLater;
   // Входная проверка (src/check-data.js): поле появляется только после неё — {d, read, count}; чужой формат — убрать
   if ("check" in s && !(s.check && typeof s.check === "object" && typeof s.check.d === "string")) delete s.check;
+  // Уровни «Логики» (src/logic-level.js): {игра: номер от 1}; не объект — убрать поле, не номер — убрать игру
+  // (уровень тогда берётся по ступеням). Верхнюю границу сверяет logicLevel: у игр она разная
+  if ("logic" in s) {
+    if (!s.logic || typeof s.logic !== "object" || Array.isArray(s.logic)) delete s.logic;
+    else for (const k of Object.keys(s.logic)) if (!(Number.isInteger(s.logic[k]) && s.logic[k] >= 1)) delete s.logic[k];
+  }
   return s;
 }
 function applyState(text) { S = fromData(JSON.parse(text)); }
@@ -189,6 +196,23 @@ async function loadState() {
     if (store === "claude") { const r = await window.storage.get(STORAGE_KEY, false); if (r && r.value) applyState(r.value); }
     else if (store === "local") { const v = window.localStorage.getItem(STORAGE_KEY); if (v) applyState(v); }
   } catch (e) { /* ключа ещё нет — это первый запуск */ }
+}
+/* Другие ключи того же хранилища (список детей и их копии — src/children.js). Без хранилища — в памяти */
+const memory = new Map();
+async function storeGet(key) {
+  if (store === "claude") { try { const r = await window.storage.get(key, false); return r && r.value ? r.value : null; } catch (e) { return null; } }
+  if (store === "local") return window.localStorage.getItem(key);
+  return memory.has(key) ? memory.get(key) : null;
+}
+async function storeSet(key, text) {
+  if (store === "claude") await window.storage.set(key, text, false);
+  else if (store === "local") window.localStorage.setItem(key, text);
+  else memory.set(key, text);
+}
+async function storeDel(key) {
+  if (store === "claude") { if (typeof window.storage.delete === "function") await window.storage.delete(key, false); else await window.storage.set(key, "", false); }
+  else if (store === "local") window.localStorage.removeItem(key);
+  else memory.delete(key);
 }
 let saveTimer = null;
 function save() { clearTimeout(saveTimer); saveTimer = setTimeout(flush, 300); }
@@ -1052,13 +1076,13 @@ function nextTextIdx() { const i = PROGRAM.testTexts.findIndex((_, k) => !S.text
 /* Уровень текстов для ежедневного чтения: второй (50–70 слов) — когда в последнем замере чтения
    верных слов в минуту 35+ и точность 95%+, третий (70–90 слов, с 1.5.0) — когда 50+ и точность 95%+.
    В старых строках точности нет — тогда общая скорость */
-function levelRow(w, wpm) {
+function levelRow$1(w, wpm) {
   if (!w) return false;
   if (w.wcpm != null && w.acc != null) return w.wcpm >= wpm && w.acc >= 95;
   return w.wpm != null && w.wpm >= wpm;
 }
-const level2Row = w => levelRow(w, 35);
-const level3Row = w => levelRow(w, 50);
+const level2Row = w => levelRow$1(w, 35);
+const level3Row = w => levelRow$1(w, 50);
 const lastReadRow = () => [...S.weekly].reverse().find(w => w.wpm != null || w.wcpm != null) || null;
 const rowLevel = w => (level3Row(w) ? 3 : level2Row(w) ? 2 : 1);
 const readLevel = () => rowLevel(lastReadRow());
@@ -1335,6 +1359,98 @@ function sprout(n) {
 </svg>`;
 }
 
+/* ---------- Несколько детей в одном приложении (с 1.9.0) ----------
+   Обратная совместимость — главное: ключ STORAGE_KEY остаётся тем, чем был, — данными ребёнка, который
+   сейчас занимается. Старая версия приложения, открытая на тех же данных, увидит его и ничего не испортит.
+   Файл резервной копии — как раньше, у каждого ребёнка свой; загрузка файла меняет данные только того,
+   кто сейчас выбран.
+
+   Пока ребёнок один, ничего нового в хранилище нет. Со вторым появляются:
+   · CHILDREN_KEY — {active: "c2", list: [{id: "c1", name: "Мирон"}, {id: "c2", name: "Аня"}]};
+   · «stupenki-child-c1» — копия данных каждого ребёнка (у выбранного — на момент последнего переключения).
+   Переключение: записать нынешнего в его копию → прочитать копию другого → только если она разобралась,
+   заменить S → записать список и основной ключ. Не разобралась — остаёмся, где были, ничего не тронуто.
+   Имя в списке — для кнопок; у выбранного оно берётся из S.childName. */
+const CHILDREN_KEY = "stupenki-children-v1";
+const slot = id => `stupenki-child-${id}`;
+let index = null;                                   // {active, list} или null, пока ребёнок один
+
+const validIndex = v => v && typeof v === "object" && Array.isArray(v.list) && v.list.length > 0
+  && v.list.every(c => c && typeof c.id === "string" && /^c\d+$/.test(c.id) && typeof c.name === "string")
+  && new Set(v.list.map(c => c.id)).size === v.list.length && v.list.some(c => c.id === v.active);
+
+/* При запуске, после loadState: есть ли список детей. Испорченный список — как будто его нет (ребёнок один) */
+async function loadChildren() {
+  index = null;
+  try {
+    const text = await storeGet(CHILDREN_KEY);
+    const v = text ? JSON.parse(text) : null;
+    if (validIndex(v)) index = { active: v.active, list: v.list.map(c => ({ id: c.id, name: c.name })) };
+  } catch (e) { index = null; }
+}
+/* Кто есть: [{id, name, active}]; ребёнок один — список из него одного (id «c1») */
+function children() {
+  if (!index) return [{ id: "c1", name: S.childName, active: true }];
+  return index.list.map(c => ({ id: c.id, name: c.id === index.active ? S.childName : c.name, active: c.id === index.active }));
+}
+const hasSeveral = () => !!index && index.list.length > 1;
+const saveIndex = () => storeSet(CHILDREN_KEY, JSON.stringify(index));
+/* Нынешнего — в его копию и в основной ключ; имя в списке — как в данных */
+async function park() {
+  if (!index) index = { active: "c1", list: [{ id: "c1", name: S.childName }] };
+  index.list.find(c => c.id === index.active).name = S.childName;
+  await flush();
+  await storeSet(slot(index.active), JSON.stringify(S));
+}
+
+/* «Добавить ребёнка»: нынешний сохраняется, новый начинает с чистого листа (первый запуск спросит имя) */
+async function addChild() {
+  await park();
+  const n = Math.max(...index.list.map(c => Number(c.id.slice(1)))) + 1, id = `c${n}`;
+  index.list.push({ id, name: "" });
+  index.active = id;
+  replaceState(clone(DEFAULT_STATE));
+  await storeSet(slot(id), JSON.stringify(S));
+  await saveIndex();
+  await flush();
+  return id;
+}
+/* Переключиться. true — получилось; false — копия не нашлась или не разобралась: всё осталось как было */
+async function pickChild(id) {
+  if (!index || id === index.active || !index.list.some(c => c.id === id)) return false;
+  let next;
+  try {
+    const text = await storeGet(slot(id));
+    const data = text ? JSON.parse(text) : null;
+    if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+    next = fromData(data);
+  } catch (e) { return false; }
+  await park();
+  index.active = id;
+  replaceState(next);
+  await saveIndex();
+  await flush();
+  return true;
+}
+/* Убрать выбранного ребёнка вместе с его данными; выбранным становится первый из оставшихся.
+   Единственного убрать нельзя (для этого — «Стереть все данные»). Возвращает имя убранного или null */
+async function dropChild() {
+  if (!hasSeveral()) return null;
+  const gone = index.active, name = S.childName, rest = index.list.filter(c => c.id !== gone);
+  let next;
+  try {
+    const data = JSON.parse(await storeGet(slot(rest[0].id)));
+    if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+    next = fromData(data);
+  } catch (e) { return null; }                       // не к кому перейти — ничего не трогаем
+  index = { active: rest[0].id, list: rest };
+  replaceState(next);
+  await saveIndex();
+  await flush();
+  await storeDel(slot(gone));
+  return name || "Без имени";
+}
+
 /* Картинки: всё, что рисуется линией, как ручкой (SVG) */
 
 const CHECK = '<svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path d="M4 13.5l5 4.5L20 6" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>';
@@ -1368,6 +1484,7 @@ const ICONS = {
   sentences: `<path d="M4 7h28M4 13h28M4 19h17"/><circle cx="27.5" cy="27" r="6"/><text x="25" y="30.6" style="font-size:9.5px">?</text>`,
   // с 1.7.0: «До 100» — два пучка по десять палочек и три палочки; «Деление» — «12 : 3» и тарелки
   sticks: `${[3.5, 13.5].map(x => `<path d="M${x} 5v26M${x + 2} 5v26M${x + 4} 5v26M${x + 6} 5v26"/><path d="M${x - 1.5} 18h9" style="stroke:var(--margin);stroke-width:3"/>`).join("")}<path d="M25 5v26M29 5v26M33 5v26"/>`,
+  logic: `<circle cx="9" cy="9" r="5.5"/><circle cx="27" cy="9" r="5.5"/><circle cx="9" cy="27" r="5.5"/><path d="M21.5 21.5h11v11h-11z" style="stroke:var(--margin)"/>`,
   div: `<text x="2" y="15" style="font-size:12px">12 : 3</text>${
     [7, 18, 29].map(x => `<rect x="${x - 5.5}" y="25" width="11" height="6" rx="3"/><circle class="fill" cx="${x}" cy="23" r="1.7"/>`).join("")}`,
   sticker: `<path d="M9 5h18a4 4 0 0 1 4 4v12L21 31H9a4 4 0 0 1-4-4V9a4 4 0 0 1 4-4z"/><path d="M31 21h-6a4 4 0 0 0-4 4v6"/><path class="fill" d="M16.5 9.5l1.9 3.9 4.3.6-3.1 3 .7 4.3-3.8-2-3.8 2 .7-4.3-3.1-3 4.3-.6z"/>`
@@ -1462,7 +1579,7 @@ const ui = {
   spanSeq: { fwd: null, bwd: null },
   muha: null, rev: null, dictFig: null,
   anagram: { i: 0, shown: false, order: null, word: null },
-  copyBox: null, resetArmed: false, fresh: false, quickSpan: null,
+  copyBox: null, resetArmed: false, dropArmed: false, fresh: false, quickSpan: null,
   miniTarget: null,       // id кнопки маленького таймера
   // детские экраны
   sch: null, syl: null, txt: null, fly: null, pairsG: null, chainG: null, out: null,
@@ -1479,6 +1596,7 @@ const ui = {
   mrg: null,              // «Слоги из букв»: {mode: merge | find, letters, moves, i, ok, …} (src/overlays/merge.js)
   wd3: null,              // «Слова и фразы»: {mode: find | read | phrases, letters, moves, i, ok, …} (src/overlays/words3.js)
   snt: null,              // «Предложения»: {k: номер текста, screen: text | q | end, q, ok, …} (src/overlays/sentences.js)
+  lg: null,               // «Логика»: {screen: home | play | end, game, level, turns или sud, i, firstOk, …} (src/overlays/logic.js)
   chk: null,              // входная проверка: {phase: run | done, line, done: {read, count}, letters, sel, …} (src/overlays/entry-check.js)
   won: null,              // наклейка, полученная на открытом детском экране: {d, id, from}
   album: null,            // открыт альбом «Мои наклейки»: {back: с какого детского экрана пришли или null}
@@ -1562,6 +1680,13 @@ function miniBtn(id, sec, label) {
 function card(act, data, ic, title, sub) {
   const attrs = Object.entries(data || {}).map(([k, v]) => `data-${k}="${v}"`).join(" ");
   return `<button class="card" data-act="${act}" ${attrs}>${icon(ic)}<b>${title}</b><small>${sub}</small></button>`;
+}
+
+/* Кто занимается: кнопки с именами — на главной и на первом запуске, когда детей несколько (src/children.js) */
+function childrenBar() {
+  if (!hasSeveral()) return "";
+  return `<nav class="kids-bar" aria-label="Кто занимается">${children().map(c =>
+    `<button class="btn small${c.active ? " picked" : ""}" data-act="childPick" data-id="${c.id}" aria-pressed="${c.active}">${esc(c.name) || "Без имени"}</button>`).join("")}</nav>`;
 }
 
 /* =============================================================
@@ -2719,12 +2844,573 @@ function praiseLines() {
   return out;
 }
 
+/* ---------- «Логика» (с 1.8.0): данные без страницы и без S ----------
+   Тренажёр — src/overlays/logic.js. Модуль зависит только от utils и pictures (заливки картинок):
+   его проверяет tests/logic-data.spec.js прямо в Node (у каждого хода — ровно один верный ответ).
+
+   Пять игр, у каждой уровни по нарастающей (от пяти лет до девяти):
+   odd    «Что лишнее?»      1 — три одинаковые фигуры и одна другая; 2 — три похожи чем-то одним
+                             (формой, цветом или размером), остальное у всех разное; 3 — картинки,
+                             далёкие группы (животные и машина); 4 — близкие (звери и птица).
+   row    «Что дальше?»      1 — через одну (АБАБ); 2 — тройками (ААБ, АББ, АБВ); 3 — форма и цвет
+                             повторяются каждый по-своему; 4 — ряды чисел.
+   matrix «Чего не хватает?» 1 — таблица 2 × 2 (строка — форма, столбец — цвет); 2 — 3 × 3;
+                             3 — 3 × 3, форма и сколько фигур; 4 — «каждая по разу в строке и столбце».
+   sudoku «Судоку»           1 — 3 × 3, три пустые клетки; 2 — 4 × 4, четыре; 3 — 4 × 4, шесть;
+                             4 — 4 × 4 с цифрами, восемь. Клетки спрашиваются по порядку, и каждая
+                             в свой черёд решается одним взглядом: в строке, столбце и квадрате
+                             остаётся ровно одна возможность.
+   think  «Рассуждай»        задачи словами: кто выше всех, у кого что, дни недели; 3 уровня.
+   Ход фигурами — { shape, color, size: "b" | "s", n: сколько штук }, картинкой — { w },
+   числом — { num }. why — что сказать родителю, когда ход решён. */
+const SHAPES = ["circle", "square", "triangle", "star", "heart"];
+const COLORS = ["red", "yel", "blu", "lil"];
+/* Род: m, f, n — для подписей «красный круг», «жёлтая звезда», «синее сердечко» */
+const SHAPE_WORD = {
+  circle: { one: "круг", many: "круги", g: "m" },
+  square: { one: "квадрат", many: "квадраты", g: "m" },
+  triangle: { one: "треугольник", many: "треугольники", g: "m" },
+  star: { one: "звезда", many: "звёзды", g: "f" },
+  heart: { one: "сердечко", many: "сердечки", g: "n" }
+};
+const COLOR_WORD = {
+  red: { m: "красный", f: "красная", n: "красное", many: "красные" },
+  yel: { m: "жёлтый", f: "жёлтая", n: "жёлтое", many: "жёлтые" },
+  blu: { m: "синий", f: "синяя", n: "синее", many: "синие" },
+  lil: { m: "фиолетовый", f: "фиолетовая", n: "фиолетовое", many: "фиолетовые" }
+};
+const SIZE_WORD = {
+  b: { m: "большой", f: "большая", n: "большое", many: "большие" },
+  s: { m: "маленький", f: "маленькая", n: "маленькое", many: "маленькие" }
+};
+const LOGIC_GAMES = ["odd", "row", "matrix", "sudoku", "think"];
+const LOGIC_LEVELS = { odd: 4, row: 4, matrix: 4, sudoku: 4, think: 3 };
+const TURNS = 5;
+
+const pick = arr => arr[rnd(arr.length)];
+const sample = (arr, k) => shuffle(arr).slice(0, k);
+const fig = (shape, color, size = "b", n = 1) => ({ shape, color, size, n });
+/* Ключ хода-картинки: одинаковые фигуры — одинаковый ключ */
+const itemKey = it => (it.w ? `w:${it.w}` : "num" in it ? `n:${it.num}` : `${it.shape}-${it.color}-${it.size}-${it.n}`);
+/* Подпись для экранного диктора: «маленький красный круг», «жёлтая звезда, 2 шт.», «кот», «7» */
+function itemLabel(it) {
+  if (it.w) return it.w;
+  if ("num" in it) return String(it.num);
+  const s = SHAPE_WORD[it.shape];
+  return `${it.size === "s" ? SIZE_WORD.s[s.g] + " " : ""}${COLOR_WORD[it.color][s.g]} ${s.one}${it.n > 1 ? `, ${it.n} шт.` : ""}`;
+}
+
+/* ================= «Что лишнее?» ================= */
+
+/* Уровень 1: три одинаковые и одна, у которой другое что-то одно — форма, цвет или размер */
+function oddSame() {
+  const rule = pick(["shape", "color", "size"]);
+  const [s1, s2] = sample(SHAPES, 2), [c1, c2] = sample(COLORS, 2), [z1, z2] = rule === "size" ? shuffle(["b", "s"]) : ["b", "b"];
+  const base = fig(s1, c1, z1);
+  const other = rule === "shape" ? fig(s2, c1, z1) : rule === "color" ? fig(s1, c2, z1) : fig(s1, c1, z2);
+  return oddOf(rule, [base, base, base], other);
+}
+/* Уровень 2: общее у трёх — что-то одно, остальное у всех разное (там лишнего нет) */
+function oddMixed() {
+  const rule = pick(["shape", "color", "size"]);
+  const shapes = rule === "shape" ? Array(3).fill(pick(SHAPES)) : sample(SHAPES, 3);
+  const colors = rule === "color" ? Array(3).fill(pick(COLORS)) : sample(COLORS, 3);
+  const size = rule === "size" ? pick(["b", "s"]) : "b";
+  const three = [0, 1, 2].map(i => fig(shapes[i], colors[i], size));
+  const other = fig(
+    rule === "shape" ? pick(SHAPES.filter(s => s !== shapes[0])) : pick(SHAPES),
+    rule === "color" ? pick(COLORS.filter(c => c !== colors[0])) : pick(COLORS),
+    rule === "size" ? (size === "b" ? "s" : "b") : "b");
+  return oddOf(rule, three, other);
+}
+function oddOf(rule, three, other) {
+  const odd = rnd(4), items = [...three];
+  items.splice(odd, 0, other);
+  const s = SHAPE_WORD[other.shape], m = three[0];
+  const why = rule === "shape" ? `${{ m: "Лишний", f: "Лишняя", n: "Лишнее" }[s.g]} — ${s.one}: остальные — ${SHAPE_WORD[m.shape].many}.`
+    : rule === "color" ? `Лишняя фигура — ${COLOR_WORD[other.color].f}: остальные ${COLOR_WORD[m.color].many}.`
+      : `Лишняя фигура — ${SIZE_WORD[other.size].f}: остальные ${SIZE_WORD[m.size].many}.`;
+  return { items, odd, rule, why };
+}
+
+/* Картинки (src/pictures.js) по группам. items — все картинки группы: группа — ещё и признак,
+   по которому сверяется, нет ли другой тройки; pick — из каких берём три (без спорных: муха — тоже
+   животное, но ребёнок скажет «насекомое»); loose — подборка, а не признак */
+const PIC_GROUPS = {
+  animals: { label: "животные", items: ["зайка", "жираф", "енот", "ёж", "кот", "слон", "лиса", "сова", "утка", "цыплёнок", "пчела", "муха", "жук", "кит", "рыба", "рак", "паук", "улитка"],
+    pick: ["зайка", "жираф", "енот", "ёж", "кот", "слон", "лиса", "сова", "утка", "цыплёнок", "пчела", "жук", "кит", "рыба", "улитка"] },
+  food: { label: "еда", items: ["банан", "яблоко", "лимон", "малина", "арбуз", "тыква", "лук", "конфета", "торт", "хлеб", "сыр", "суп"],
+    pick: ["банан", "яблоко", "лимон", "малина", "арбуз", "тыква", "конфета", "торт", "хлеб", "сыр", "суп"] },
+  transport: { label: "транспорт", items: ["машина", "лодка", "ракета", "самолёт", "экскаватор", "сани"], pick: ["машина", "лодка", "ракета", "самолёт", "экскаватор"] },
+  body: { label: "части тела", items: ["глаз", "нос", "рот", "ухо", "рука", "зуб", "усы"], pick: ["глаз", "нос", "рот", "ухо", "рука", "зуб"] },
+  sky: { label: "то, что видно на небе", items: ["звезда", "луна", "облако"] },
+  toys: { label: "игрушки", items: ["кукла", "юла", "робот"] },
+  /* близкие группы — уровень 4 */
+  beasts: { label: "звери", one: "зверь", items: ["зайка", "жираф", "енот", "ёж", "кот", "слон", "лиса"] },
+  birds: { label: "птицы", one: "птица", items: ["сова", "утка", "цыплёнок"] },
+  insects: { label: "насекомые", one: "насекомое", items: ["пчела", "муха", "жук"] },
+  water: { label: "те, кто живёт в воде", items: ["кит", "рыба", "рак"] },
+  fruit: { label: "фрукты и ягоды", items: ["банан", "яблоко", "лимон", "малина", "арбуз"] },
+  veg: { label: "овощи", one: "овощ", items: ["тыква", "лук"] },
+  sweet: { label: "сладости", one: "сладость", items: ["конфета", "торт"] },
+  dishes: { label: "посуда", one: "посуда: её не едят", items: ["ложка", "чайник"] },
+  head: { label: "то, что у нас на голове", items: ["глаз", "нос", "рот", "ухо", "усы", "зуб"] },
+  meal: { label: "еда", loose: true, items: ["суп", "хлеб", "сыр", "торт"] },
+  hand: { label: "рука", loose: true, items: ["рука"] }
+};
+/* Кто с кем: три картинки из первой группы, лишняя — из одной из вторых.
+   Далёкие (уровень 3): к еде животных не берём — рыбу и утку тоже едят. */
+const PIC_FAR = {
+  animals: ["food", "transport", "body", "sky", "toys"],
+  food: ["transport", "body", "sky", "toys"],
+  transport: ["animals", "food", "body", "sky", "toys"],
+  body: ["animals", "food", "transport", "sky", "toys"],
+  sky: ["animals", "food", "transport", "body", "toys"],
+  toys: ["animals", "food", "transport", "body", "sky"]
+};
+/* Близкие (уровень 4). Кита к зверям лишним не ставим (он и сам зверь), утку — к тем, кто в воде */
+const PIC_NEAR = {
+  beasts: ["birds", "insects"],
+  birds: ["beasts"],
+  insects: ["beasts", "birds"],
+  water: ["beasts", "insects"],
+  fruit: ["veg", "sweet"],
+  meal: ["dishes"],
+  head: ["hand"]
+};
+/* Чем ещё картинки похожи: по этим признакам ребёнок тоже может собрать «три вместе» */
+const PIC_LINKS = {
+  fly: ["сова", "утка", "пчела", "муха", "жук", "самолёт", "ракета"],
+  swim: ["кит", "рыба", "рак", "лодка", "утка"],
+  inSky: ["звезда", "луна", "облако", "самолёт", "ракета"],
+  eaten: ["банан", "яблоко", "лимон", "малина", "арбуз", "тыква", "лук", "конфета", "торт", "хлеб", "сыр", "суп", "рыба", "утка", "рак", "цыплёнок"],
+  round: ["арбуз", "яблоко", "тыква", "лук", "луна", "юла", "малина", "лимон"]
+};
+/* Группа и связь — об одном и том же: «на небе» и самолёт, «еда» и рыба. Такую картинку лишней не ставим:
+   про неё нельзя сказать «остальное — на небе, а это нет» */
+const PIC_SAME = { sky: "inSky", food: "eaten", meal: "eaten", water: "swim" };
+const PIC_COLOR = Object.fromEntries(PICTURES.map(p => [p.w, p.c || ""]));
+/* Признаки картинки: группы, связи и цвет заливки (три жёлтые и одна красная — тоже «три вместе») */
+function picTags(w) {
+  const tags = [];
+  for (const [k, g] of Object.entries(PIC_GROUPS)) if (!g.loose && g.items.includes(w)) tags.push(k);
+  for (const [k, list] of Object.entries(PIC_LINKS)) if (list.includes(w)) tags.push(k);
+  if (PIC_COLOR[w]) tags.push(`c:${PIC_COLOR[w]}`);
+  return tags;
+}
+/* Лишняя — одна: любой признак, общий ровно у трёх картинок, — у тех самых трёх */
+function oddClear(words, odd) {
+  const tags = words.map(picTags);
+  for (const t of new Set(tags.flat())) {
+    const has = tags.map(list => list.includes(t));
+    if (has.filter(Boolean).length === 3 && has[odd]) return false;
+  }
+  return true;
+}
+/* Уровни 3 и 4: main — из какой группы три (в круге группы разные) */
+function oddPictures(level, main) {
+  const map = level >= 4 ? PIC_NEAR : PIC_FAR;
+  const m = main && map[main] ? main : pick(Object.keys(map));
+  for (let tries = 0; tries < 200; tries++) {
+    const other = pick(map[m]), three = sample(PIC_GROUPS[m].pick || PIC_GROUPS[m].items, 3);
+    const same = PIC_LINKS[PIC_SAME[m]] || [];
+    const w = pick((PIC_GROUPS[other].pick || PIC_GROUPS[other].items).filter(x => !PIC_GROUPS[m].items.includes(x) && !same.includes(x)));
+    const odd = rnd(4), words = [...three];
+    words.splice(odd, 0, w);
+    if (!oddClear(words, odd)) continue;
+    const one = PIC_GROUPS[other].one;
+    return { items: words.map(x => ({ w: x })), odd, rule: m,
+      why: `Лишнее — ${w}: остальное — ${PIC_GROUPS[m].label}${one ? `, а ${w} — ${one}` : ""}.` };
+  }
+  return { items: ["кот", "слон", "машина", "лиса"].map(w => ({ w })), odd: 2, rule: "animals", why: "Лишнее — машина: остальное — животные." };
+}
+const oddTurn = (level, main) => (level === 1 ? oddSame() : level === 2 ? oddMixed() : oddPictures(level, main));
+
+/* ================= «Что дальше?» ================= */
+
+/* Несколько разных фигур: отличаются формой, цветом или и тем и другим */
+function distinctFigs(k) {
+  const mode = pick(["shape", "color", "both"]);
+  const shapes = mode === "color" ? Array(k).fill(pick(SHAPES)) : sample(SHAPES, k);
+  const colors = mode === "shape" ? Array(k).fill(pick(COLORS)) : sample(COLORS, k);
+  return shapes.map((s, i) => fig(s, colors[i]));
+}
+/* Уровни 1 и 2: кусочек повторяется; ряд начинается с любого места кусочка */
+function rowRepeat(level) {
+  const [a, b, c] = distinctFigs(3);
+  const unit = level === 1 ? [a, b] : pick([[a, a, b], [a, b, b], [a, b, c]]);
+  const from = rnd(unit.length), shown = level === 1 ? 5 + rnd(2) : 6;
+  const at = i => unit[(from + i) % unit.length];
+  const row = Array.from({ length: shown }, (_, i) => at(i)), next = at(shown);
+  const opts = shuffle([a, b, c]);
+  return { row, opts, right: opts.findIndex(o => itemKey(o) === itemKey(next)),
+    why: level === 1 ? "Фигуры идут через одну: первая, вторая, снова первая, снова вторая."
+      : `Повторяется тройка: ${row.slice(0, 3).map(itemLabel).join(", ")}.` };
+}
+/* Уровень 3: один признак повторяется через раз, другой — по кругу из трёх. Показаны пять или шесть:
+   после пяти нужной фигуры в ряду ещё не было (её надо собрать из двух правил), после шести ряд
+   начинается заново — так ни «бери новую», ни «бери первую» не срабатывает каждый раз */
+function rowTwoRules() {
+  const [p2, p3] = pick([["shape", "color"], ["color", "shape"], ["size", "shape"], ["size", "color"]]);
+  const vals = { shape: sample(SHAPES, 3), color: sample(COLORS, 3), size: shuffle(["b", "s"]) };
+  const base = { shape: vals.shape[0], color: vals.color[0], size: "b" };
+  const at = i => { const f = { ...base, [p2]: vals[p2][i % 2], [p3]: vals[p3][i % 3] }; return fig(f.shape, f.color, f.size); };
+  const shown = 5 + rnd(2), row = Array.from({ length: shown }, (_, i) => at(i)), next = at(shown);
+  const o2 = vals[p2][(shown + 1) % 2], o3 = vals[p3][(shown + 1) % 3];
+  const w2 = { ...next, [p2]: o2 }, w3 = { ...next, [p3]: o3 }, wBoth = { ...w2, [p3]: o3 };
+  const opts = shuffle([next, w2, w3, wBoth]);
+  const word = { shape: "форма", color: "цвет", size: "размер" };
+  return { row, opts, right: opts.indexOf(next),
+    why: `Смотри отдельно: ${word[p2]} меняется через раз, ${word[p3]} идёт по кругу из трёх.` };
+}
+/* Уровень 4: числа. Шаг — на сколько растёт или убывает; «по очереди» — два шага;
+   «растёт» — шаг каждый раз на один больше */
+function rowNumbers() {
+  const kind = pick(["step", "step", "two", "grow"]);
+  let nums, why, trap;
+  if (kind === "step") {
+    const d = pick([2, 3, 4, 5, 10, -2, -3, -5, -10]), a = Math.abs(d);
+    const start = d > 0 ? 1 + rnd(a === 10 ? 20 : 12) : 5 * a + rnd(a === 10 ? 20 : 10);
+    nums = [0, 1, 2, 3, 4, 5].map(i => start + d * i);
+    why = `Каждое число на ${a} ${d > 0 ? "больше" : "меньше"} прежнего.`;
+    trap = nums[5] + d;                                              // перескочил через одно
+  } else if (kind === "two") {
+    const [x, y] = pick([[1, 2], [2, 1], [1, 3], [3, 1], [2, 3]]), start = 1 + rnd(9);
+    nums = [start];
+    for (let i = 0; i < 6; i++) nums.push(nums[i] + (i % 2 ? y : x));
+    why = `Прибавляем по очереди: ${x}, потом ${y}, снова ${x}, снова ${y}.`;
+    trap = nums[5] + x;                                              // не тот шаг из двух
+  } else {
+    const start = 1 + rnd(9);
+    nums = [start];
+    for (let i = 0; i < 5; i++) nums.push(nums[i] + i + 1);
+    why = "Прибавляем 1, потом 2, потом 3 — каждый раз на один больше.";
+    trap = nums[4] + 4;                                              // шаг не вырос
+  }
+  const right = nums[nums.length - 1], row = nums.slice(0, -1);
+  const wrong = [];
+  for (const v of [trap, ...shuffle([right + 1, right - 1, right + 2, right - 2])]) {
+    if (wrong.length < 3 && v >= 0 && v !== right && !wrong.includes(v)) wrong.push(v);
+  }
+  for (let v = right + 3; wrong.length < 3; v++) if (!wrong.includes(v)) wrong.push(v);   // у нуля соседей снизу нет
+  const opts = shuffle([right, ...wrong]).map(num => ({ num }));
+  return { row: row.map(num => ({ num })), opts, right: opts.findIndex(o => o.num === right), why, kind };
+}
+const rowTurn = level => (level <= 2 ? rowRepeat(level) : level === 3 ? rowTwoRules() : rowNumbers());
+
+/* ================= «Чего не хватает?» ================= */
+
+/* Четыре ответа: верный, не та строка, не тот столбец, не то и не другое.
+   make(r, c) — что стоит в клетке; hole — пустая клетка */
+function gridTurn(size, make, hole, why) {
+  const [hr, hc] = hole, r2 = (hr + 1) % size, c2 = (hc + 1) % size;
+  const cells = [];
+  for (let r = 0; r < size; r++) for (let c = 0; c < size; c++) cells.push(r === hr && c === hc ? null : make(r, c));
+  const right = make(hr, hc);
+  const opts = shuffle([right, make(r2, hc), make(hr, c2), make(r2, c2)]);
+  return { size, cells, opts, right: opts.indexOf(right), why };
+}
+/* Уровни 1 и 2: в строке одна форма, в столбце один цвет (или наоборот). Пустая — последняя */
+function matrixShapeColor(size) {
+  const shapes = sample(SHAPES, size), colors = sample(COLORS, size), flip = rnd(2) === 1;
+  const make = (r, c) => (flip ? fig(shapes[c], colors[r]) : fig(shapes[r], colors[c]));
+  return gridTurn(size, make, [size - 1, size - 1], flip ? "В строке — один цвет, в столбце — одна форма." : "В строке — одна форма, в столбце — один цвет.");
+}
+/* Уровень 3: форма и сколько фигур. Пустая — любая */
+function matrixCount() {
+  const shapes = sample(SHAPES, 3), color = pick(COLORS), flip = rnd(2) === 1;
+  const make = (r, c) => (flip ? fig(shapes[c], color, "b", r + 1) : fig(shapes[r], color, "b", c + 1));
+  return gridTurn(3, make, [rnd(3), rnd(3)], flip ? "В строке — фигур поровну, в столбце — одна форма." : "В строке — одна форма, в столбце — фигур поровну.");
+}
+/* Уровень 4: в каждой строке и в каждом столбце — все три по разу.
+   simple — три готовые фигуры; иначе формы и цвета расставлены каждые по-своему */
+function matrixLatin(simple) {
+  const shapes = sample(SHAPES, 3), colors = sample(COLORS, 3), rows = shuffle([0, 1, 2]), cols = shuffle([0, 1, 2]);
+  const a = (r, c) => (rows[r] + cols[c]) % 3, b = (r, c) => (rows[r] + 2 * cols[c]) % 3;
+  const make = (r, c) => (simple ? fig(shapes[a(r, c)], colors[a(r, c)]) : fig(shapes[a(r, c)], colors[b(r, c)]));
+  const hole = [rnd(3), rnd(3)], [hr, hc] = hole;
+  const cells = [];
+  for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) cells.push(r === hr && c === hc ? null : make(r, c));
+  const right = make(hr, hc);
+  const others = simple ? [1, 2].map(k => fig(shapes[(a(hr, hc) + k) % 3], colors[(a(hr, hc) + k) % 3]))
+    : [fig(right.shape, colors[(b(hr, hc) + 1) % 3]), fig(shapes[(a(hr, hc) + 1) % 3], right.color), fig(shapes[(a(hr, hc) + 2) % 3], colors[(b(hr, hc) + 2) % 3])];
+  const opts = shuffle([right, ...others]);
+  return { size: 3, cells, opts, right: opts.indexOf(right),
+    why: simple ? "В каждой строке и в каждом столбце — все три фигуры по одному разу."
+      : "В каждой строке и в каждом столбце — все три формы и все три цвета по одному разу." };
+}
+/* i — номер хода: на уровне 4 сначала попроще, последний — тоже (заканчиваем на удаче) */
+const matrixTurn = (level, i = 0) => (level === 1 ? matrixShapeColor(2) : level === 2 ? matrixShapeColor(3)
+  : level === 3 ? matrixCount() : matrixLatin(i < 2 || i === TURNS - 1));
+
+/* ================= «Судоку» ================= */
+
+const SUDOKU_HOLES = [3, 4, 6, 8];
+/* Решённая сетка: 3 × 3 — каждая по разу в строке и столбце; 4 × 4 — ещё и в квадратах 2 × 2 */
+function solvedGrid(n) {
+  if (n === 3) {
+    const rows = shuffle([0, 1, 2]), cols = shuffle([0, 1, 2]), sym = shuffle([0, 1, 2]);
+    return rows.map(r => cols.map(c => sym[(r + c) % 3]));
+  }
+  const base = [[0, 1, 2, 3], [2, 3, 0, 1], [1, 0, 3, 2], [3, 2, 1, 0]];
+  const lines = () => shuffle([shuffle([0, 1]), shuffle([2, 3])]).flat();   // пары строк — внутри пары и пары между собой
+  const rows = lines(), cols = lines(), sym = shuffle([0, 1, 2, 3]);
+  return rows.map(r => cols.map(c => sym[base[r][c]]));
+}
+/* Что может стоять в клетке: чего ещё нет в её строке, столбце и (в 4 × 4) квадрате */
+function candidates(grid, r, c) {
+  const n = grid.length, seen = new Set();
+  for (let i = 0; i < n; i++) { seen.add(grid[r][i]); seen.add(grid[i][c]); }
+  if (n === 4) {
+    const r0 = r - (r % 2), c0 = c - (c % 2);
+    for (const [y, x] of [[r0, c0], [r0, c0 + 1], [r0 + 1, c0], [r0 + 1, c0 + 1]]) seen.add(grid[y][x]);
+  }
+  return Array.from({ length: n }, (_, v) => v).filter(v => !seen.has(v));
+}
+/* В каком порядке спрашивать пустые клетки, чтобы каждая решалась сразу; не выходит — null.
+   easy — клетка последняя пустая в своей строке, столбце или квадрате («одной не хватает») */
+function askOrder(solved, holes, easy) {
+  const n = solved.length, grid = solved.map(row => [...row]), left = [...holes].sort((p, q) => p[0] - q[0] || p[1] - q[1]), order = [];
+  for (const [r, c] of holes) grid[r][c] = null;
+  const lone = (r, c) => {
+    const empty = cells => cells.filter(([y, x]) => grid[y][x] === null).length === 1;
+    const idx = Array.from({ length: n }, (_, i) => i), r0 = r - (r % 2), c0 = c - (c % 2);
+    return empty(idx.map(i => [r, i])) || empty(idx.map(i => [i, c]))
+      || (n === 4 && empty([[r0, c0], [r0, c0 + 1], [r0 + 1, c0], [r0 + 1, c0 + 1]]));
+  };
+  while (left.length) {
+    const k = left.findIndex(([r, c]) => candidates(grid, r, c).length === 1 && (!easy || lone(r, c)));
+    if (k < 0) return null;
+    const [[r, c]] = left.splice(k, 1);
+    grid[r][c] = solved[r][c];
+    order.push([r, c]);
+  }
+  return order;
+}
+/* Судоку уровня: solved — ответы, holes — пустые клетки в порядке вопросов, symbols — что стоит
+   в клетках (фигуры или цифры 1–4) */
+function sudokuPuzzle(level) {
+  const lv = Math.min(4, Math.max(1, level)), n = lv === 1 ? 3 : 4, count = SUDOKU_HOLES[lv - 1];
+  const all = [];
+  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) all.push([r, c]);
+  const shapes = sample(SHAPES, n), colors = sample(COLORS, n);
+  const symbols = lv === 4 ? [1, 2, 3, 4].map(num => ({ num })) : shapes.map((s, i) => fig(s, colors[i]));
+  for (let tries = 0; tries < 500; tries++) {
+    const solved = solvedGrid(n), holes = askOrder(solved, sample(all, count), lv <= 2);
+    if (holes) return { n, solved, holes, symbols, digits: lv === 4 };
+  }
+  const solved = solvedGrid(n);                                       // запасной: по одной пустой в строке — решается всегда
+  return { n, solved, holes: Array.from({ length: n }, (_, i) => [i, i]), symbols, digits: lv === 4 };
+}
+
+/* ================= «Рассуждай» ================= */
+
+const NAMES = [["Маша", "Маши"], ["Оля", "Оли"], ["Катя", "Кати"], ["Аня", "Ани"], ["Лена", "Лены"],
+  ["Дима", "Димы"], ["Петя", "Пети"], ["Вова", "Вовы"], ["Саша", "Саши"], ["Коля", "Коли"]];
+const ORDER_WORDS = [
+  { more: "выше", less: "ниже", verb: "" },
+  { more: "старше", less: "младше", verb: "" },
+  { more: "быстрее", less: "медленнее", verb: "бегает " }
+];
+/* Кто выше всех: имена по порядку, про соседей — по предложению. Уровень 1 — подряд и одним словом,
+   2 — вперемешку и то «выше», то «ниже», 3 — четверо */
+function thinkOrder(level) {
+  const k = level >= 3 ? 4 : 3, names = sample(NAMES, k).map(x => x[0]), rel = pick(ORDER_WORDS);
+  let facts = names.slice(0, -1).map((a, i) => [a, names[i + 1]]);
+  const say = ([a, b], less) => (less ? `${b} ${rel.verb}${rel.less}, чем ${a}.` : `${a} ${rel.verb}${rel.more}, чем ${b}.`);
+  let text;
+  if (level === 1) text = facts.map(f => say(f, false));
+  else {
+    const less = shuffle(facts.map((_, i) => i % 2 === 1));          // и «выше», и «ниже» — хотя бы по разу
+    text = facts.map((f, i) => say(f, less[i]));
+    if (level >= 3 || rnd(2)) text.reverse();
+    if (level >= 3 && rnd(2)) [text[0], text[1]] = [text[1], text[0]];
+  }
+  const top = rnd(2) === 0, right = top ? names[0] : names[k - 1];
+  const opts = shuffle(names);
+  return { kind: "order", text: `${text.join(" ")} Кто ${rel.verb}${top ? rel.more : rel.less} всех?`, opts, right: opts.indexOf(right),
+    why: `${rel.more.charAt(0).toUpperCase()}${rel.more.slice(1)} всех — ${names[0]}, потом ${names.slice(1).join(", потом ")}.` };
+}
+const THINK_SETS = [
+  { things: ["кошка", "собака", "рыбка"], intro: g => `У ${g[0]}, ${g[1]} и ${g[2]} живут кошка, собака и рыбка — у всех разные.`, ask: g => `Кто живёт у ${g}?` },
+  { things: ["мяч", "кубики", "машинка"], intro: g => `У ${g[0]}, ${g[1]} и ${g[2]} игрушки: мяч, кубики и машинка — у всех разные.`, ask: g => `Какая игрушка у ${g}?` },
+  { things: ["красный", "синий", "жёлтый"], intro: g => `У ${g[0]}, ${g[1]} и ${g[2]} шарики: красный, синий и жёлтый — у всех разные.`, ask: g => `Какой шарик у ${g}?` }
+];
+/* У кого что: трое, три вещи, у всех разные. p[i] — у кого, t[i] — что у него.
+   Уровень 1: про первого сказано прямо; 2 — только «не», сначала сильная подсказка;
+   3 — сначала слабая, и спрашиваем про того, о ком ничего не сказано */
+function thinkWho(level) {
+  const set = pick(THINK_SETS), p = sample(NAMES, 3), t = shuffle(set.things), g = p.map(x => x[1]);
+  const strong = level === 1 ? `У ${g[0]} — ${t[0]}.` : `У ${g[0]} не ${t[1]} и не ${t[2]}.`;
+  const weak = `У ${g[1]} не ${t[2]}.`;
+  const ask = level >= 3 ? 2 : 1 + rnd(2);
+  const opts = shuffle(set.things);
+  return { kind: "who", text: `${set.intro(shuffle(g))} ${level >= 3 ? `${weak} ${strong}` : `${strong} ${weak}`} ${set.ask(g[ask])}`,
+    opts, right: opts.indexOf(t[ask]), why: `У ${g[0]} — ${t[0]}, у ${g[1]} — ${t[1]}, у ${g[2]} — ${t[2]}.` };
+}
+const WEEK = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"];
+const WAS = ["был", "был", "была", "был", "была", "была", "было"];
+const day = i => WEEK[((i % 7) + 7) % 7];
+/* Дни недели. Уровень 1 — завтра и вчера, 2 — послезавтра и позавчера, 3 — от «вчера» к «завтра» и обратно */
+function thinkDays(level) {
+  const d = rnd(7);
+  const [text, ans] = level === 1 ? pick([[`Сегодня ${day(d)}. Какой день будет завтра?`, d + 1], [`Сегодня ${day(d)}. Какой день был вчера?`, d - 1]])
+    : level === 2 ? pick([[`Сегодня ${day(d)}. Какой день будет послезавтра?`, d + 2], [`Сегодня ${day(d)}. Какой день был позавчера?`, d - 2]])
+      : pick([[`Вчера ${WAS[d]} ${day(d)}. Какой день будет завтра?`, d + 2], [`Завтра будет ${day(d)}. Какой день был вчера?`, d - 2],
+        [`Послезавтра будет ${day(d)}. Какой день сегодня?`, d - 2], [`Позавчера ${WAS[d]} ${day(d)}. Какой день сегодня?`, d + 2]]);
+  const today = level < 3 ? d : text.startsWith("Вчера") ? d + 1 : text.startsWith("Завтра") ? d - 1 : text.startsWith("Послезавтра") ? d - 2 : d + 2;
+  const opts = shuffle([ans, ans + 1, ans - 1].map(day));
+  const near = `вчера — ${day(today - 1)}, сегодня — ${day(today)}, завтра — ${day(today + 1)}`;
+  return { kind: "days", text, opts, right: opts.indexOf(day(ans)),
+    why: level === 2 ? `Позавчера — ${day(today - 2)}, ${near}, послезавтра — ${day(today + 2)}.` : `${near.charAt(0).toUpperCase()}${near.slice(1)}.` };
+}
+const THINK_PLAN = ["order", "days", "who", "order", "who"];
+const thinkTurn = (level, i = 0) => ({ order: thinkOrder, who: thinkWho, days: thinkDays }[THINK_PLAN[i % THINK_PLAN.length]](level));
+
+/* ================= Круг ================= */
+
+/* Круг игры: пять ходов (судоку — одна сетка, ход — клетка). Ходы в круге разные;
+   в «Что лишнее?» с картинками — ещё и группы разные */
+function logicRound(game, level) {
+  const lv = Math.min(LOGIC_LEVELS[game] || 1, Math.max(1, Math.round(level) || 1));
+  if (game === "sudoku") return sudokuPuzzle(lv);
+  const mains = shuffle(Object.keys(lv >= 4 ? PIC_NEAR : PIC_FAR));
+  const make = { odd: i => oddTurn(lv, mains[i % mains.length]), row: () => rowTurn(lv), matrix: i => matrixTurn(lv, i), think: i => thinkTurn(lv, i) }[game];
+  const key = t => JSON.stringify([t.items, t.row, t.cells, t.text]), turns = [];
+  for (let i = 0; i < TURNS; i++) {
+    let t = make(i);
+    for (let tries = 0; tries < 20 && turns.some(x => key(x) === key(t)); tries++) t = make(i);
+    turns.push(t);
+  }
+  return turns;
+}
+
+/* ---------- «Логика»: уровни игр и игра дня (с 1.8.0) ----------
+   Игры и ходы — src/logic-data.js, детский экран — src/overlays/logic.js.
+   Уровень игры — S.logic[игра]: необязательное поле, в DEFAULT_STATE его нет (у тех, кто в логику
+   не играл, сохранённое не меняется). Пока поля нет, уровень берётся по ступеням ребёнка:
+   чтение Ч6 или счёт С4 и выше — 3; чтение Ч4 или счёт С2 и выше — 2; иначе 1
+   («Рассуждай» — на уровень ниже: там задачи словами). Дальше уровень ведёт сама игра:
+   круг почти без промахов — следующий сложнее, меньше половины с первого раза — легче;
+   родитель может сдвинуть сам («Легче» и «Сложнее» в полосе родителя). */
+const LOGIC_NAME = { odd: "Что лишнее?", row: "Что дальше?", matrix: "Чего не хватает?", sudoku: "Судоку", think: "Рассуждай" };
+
+function startLevel(game) {
+  const r = stageNow("read"), c = stageNow("count"), at = (v, n) => v !== null && v >= n;
+  const base = at(r, 6) || at(c, 4) ? 3 : at(r, 4) || at(c, 2) ? 2 : 1;
+  return Math.min(LOGIC_LEVELS[game], game === "think" ? Math.max(1, base - 1) : base);
+}
+const validLevel = (game, v) => Number.isInteger(v) && v >= 1 && v <= LOGIC_LEVELS[game];
+function logicLevel(game) {
+  const v = S.logic ? S.logic[game] : null;
+  return validLevel(game, v) ? v : startLevel(game);
+}
+function setLogicLevel(game, level) {
+  if (!validLevel(game, level)) return;
+  S.logic = { ...(S.logic || {}), [game]: level };
+  save();
+}
+/* Круг сыгран: ok с первого раза из of. Возвращает, куда сдвинулся уровень: 1, −1 или 0.
+   «Почти без промахов» — не больше одного промаха в круге из пяти; в коротком круге (судоку 3 × 3) — ни одного */
+function logicAfterRound(game, level, ok, of) {
+  const up = ok >= of - (of >= 4 ? 1 : 0) && level < LOGIC_LEVELS[game], down = ok * 2 < of && level > 1;
+  if (up || down) setLogicLevel(game, level + (up ? 1 : -1));
+  return up ? 1 : down ? -1 : 0;
+}
+
+/* Игра дня для занятия по ступеням: по кругу, следующая — после каждого дня с логикой.
+   «Рассуждай» — когда ребёнок уже читает предложения (Ч5 и выше); с карточки она открыта всегда */
+function logicGames() {
+  const r = stageNow("read");
+  return LOGIC_GAMES.filter(g => g !== "think" || (r !== null && r >= 5));
+}
+function logicToday() {
+  const t = todayISO(), games = logicGames();
+  const days = new Set(S.rounds.filter(x => typeof x.t === "string" && x.t.startsWith("logic-") && x.d < t).map(x => x.d)).size;
+  return games[days % games.length];
+}
+
+/* ---------- Занятие по ступеням без экрана (с 1.8.0): только данные ----------
+   Это не PROGRAM: методику Мирона этот файл не трогает. Берёт их src/screens/stages-day.js.
+
+   FINGERS — пальчиковая гимнастика в разминке: одно упражнение в день, по кругу
+   (номер занятия — rules.sessionIndex). Последние два — уже с карандашом: рука готовится к письму.
+
+   OFFSCREEN — что сделать без экрана: на каждую ступень три задания, по кругу по дням.
+   Первое в каждой тройке — то, что было единственным до 1.8.0. */
+const FINGERS = [
+  { name: "Пальчики здороваются", text: "Большой палец по очереди здоровается с каждым: с указательным, средним, безымянным, мизинцем — и обратно. Сначала одной рукой, потом другой, потом двумя сразу. Получается — с закрытыми глазами." },
+  { name: "Замок", text: "Сцепить пальцы в замок, крепко сжать и досчитать до пяти. Расцепить, встряхнуть кисти. Пять раз. Потом замок «наоборот»: сверху большой палец другой руки." },
+  { name: "Колечки", text: "Большой и указательный — в колечко. В него продеть колечко второй руки — получилась цепочка. Перебрать все пальцы по очереди: колечко с указательным, средним, безымянным, мизинцем." },
+  { name: "Пальчики шагают", text: "Указательный и средний «идут» по столу до края и обратно — не скользят, а шагают. Потом идут безымянный с мизинцем: это труднее. Потом две руки шагают навстречу друг другу." },
+  { name: "Кулак и ладошка", text: "Одна рука — в кулак, другая — ладонью на стол. Одновременно поменять. Десять смен, сначала медленно, потом быстрее. Сбился — остановились, начали снова медленно." },
+  { name: "Обведи и заштрихуй", text: "Карандаш и лист. Обвести свою ладонь, потом заштриховать каждый палец: линии в одну сторону, рядом друг с другом, не выходя за край. Карандаш держим тремя пальцами, не сжимая." }
+];
+
+const OFFSCREEN = {
+  read: [
+    ["Игра «Я вижу…»: «Я вижу то, что начинается на „м-м-м“». Звук тяни, букву не называй. Слоги — хлопками: «ма-ши-на».",
+      "«Поймай звук»: ты говоришь слова, он хлопает, когда слышит „ш“: шапка, дом, мышка, кот, шуба. Потом — другой звук.",
+      "Цепочка слов: на какой звук слово кончилось, на тот следующее начинается. «Кот — тапок — кит…» По очереди."],
+    ["Букву с экрана найдите в книжке, на коробке, вылепите из пластилина. Называйте звуком: «м», не «эм».",
+      "Напишите букву пальцем на его спине или ладони — пусть угадает. Потом он пишет тебе.",
+      "Выложите букву из палочек, пуговиц или верёвочки. Сколько палочек понадобилось? На что буква похожа?"],
+    ["Сложите слог из двух карточек и протяните: «м-м-ма». Тянущиеся согласные — тянем, взрывные — одним толчком: «ка».",
+      "Одна согласная на карточке «едет в гости» к гласным, разложенным в ряд: ма, мо, му, мы, ми. Потом — другая согласная.",
+      "Ты говоришь слог — он показывает его среди четырёх карточек. Потом наоборот: он говорит, ты ищешь (иногда «не найди» нарочно)."],
+    ["Подпишите три вещи дома карточками: «кот», «сок», «дом». Пусть найдёт и прочитает.",
+      "Записка на холодильнике из одного-двух слов: «сок тут», «мама дома». Каждый день — новая.",
+      "Три карточки со словами и три картинки (или сами вещи): пусть разложит слово к вещи."],
+    ["Перечитайте строчку слоговой таблицы, где были запинки, — ещё раз, без спешки.",
+      "Напишите крупно три слова с мягким знаком и со стечением согласных: «конь», «стол», «гриб». Сначала по слогам, потом целиком.",
+      "Слово на карточке закройте, открывайте по слогу: «ма…», «…ши…», «…на». Пусть угадает до конца — и проверит."],
+    ["Короткий текст — по предложению: прочитал — расскажи своими словами, о чём оно.",
+      "Напишите ему записку с поручением: «Возьми на столе яблоко и дай папе». Прочитал — сделал.",
+      "Разрежьте предложение на слова, перемешайте — пусть соберёт и прочитает. Начните с трёх слов."],
+    ["Читайте по очереди: абзац ты, абзац он. После текста — «почему?» и «что было бы, если…».",
+      "Пусть прочитает страницу сам, про себя, и перескажет: кто, где, что случилось. Не поправляйте по ходу.",
+      "После чтения — придумайте другое название и другой конец. Чем его конец лучше?"],
+    ["Пусть выберет книгу сам. Спросите о главном: о чём это и чем кончилось.",
+      "Чтение на двоих: каждый читает свою книгу 15 минут, потом рассказывает другому самое интересное.",
+      "Пусть прочитает вслух младшему или бабушке — рецепт, правила игры, сказку. Читать для кого-то — лучшая тренировка."]
+  ],
+  count: [
+    ["Считайте всё вокруг: ложки, ступеньки, пуговицы — касаясь каждой. «Где больше?» — на двух горстках.",
+      "Накрываем на стол: каждому по тарелке и по ложке. Хватило? Сколько ещё принести?",
+      "«Принеси столько же»: ты кладёшь четыре прищепки — он приносит столько же носков. Проверить — парами."],
+    ["Пять пальцев: сколько согнул, сколько осталось? Десять камешков — в две ладони, все способы.",
+      "Игра в кулак: пять пуговиц, часть прячешь в кулаке — сколько спрятано? Потом прячет он. Потом — с десятью.",
+      "Домино или кубик: сколько точек — сразу, не пересчитывая. Сколько не хватает до пяти? До десяти?"],
+    ["Задачи на кухне: «было 5 яблок, 2 съели». Ответ — сначала в уме, потом проверить на предметах.",
+      "Пусть сам придумает тебе задачу про свои игрушки — и проверит твой ответ. Иногда «ошибайся»: пусть поймает.",
+      "Два кубика: бросили, сложили. Кто первый наберёт три раза по десять — тот выбирает игру."],
+    ["8 + 5: сначала до десяти (8 + 2), потом остаток (+ 3). Рамка-десятка — из коробки от яиц.",
+      "Сдача в «магазине»: на прилавке 13 пуговиц, «купили» 5 — сколько осталось? Сначала до десяти, потом ещё.",
+      "Карточки от 1 до 9, тянем две: сложить. Больше десяти? Скажи, сколько не хватило первой до десятки."],
+    ["Пучки по 10 палочек и резинка: 34 — это 3 пучка и 4 палочки. Обменять пучок на 10 палочек.",
+      "Найдите числа вокруг: номер дома, страница, цена. Сколько в нём десятков? Какое число на десять больше?",
+      "Рулетка или сантиметр: измерьте стол, книгу, ладонь. Что длиннее и на сколько?"],
+    ["Цепочки вслух на ходу: по 2, по 5, по 10. Сбился — с начала, без спешки.",
+      "Считаем парами: сколько ботинок у порога? Сколько пальцев у троих? Сколько колёс у четырёх машин?",
+      "Мячик по кругу: бросаем и считаем по 3 до 30. Потом обратно от 30."],
+    ["Разложите 3 ряда по 4 предмета: сколько всего? Нарисуйте ряды к примеру 2 × 5.",
+      "Найдите умножение дома: окно в 2 ряда по 3 стекла, коробка яиц 2 по 5, плитка в ванной. Сколько всего?",
+      "Клетчатый лист: обведи прямоугольник 3 на 6 клеток. Сколько клеток внутри — не считая по одной?"],
+    ["Один столбик таблицы вслух вперемешку. Что забыл — ряды точек на бумаге.",
+      "Карточки с примерами одного столбика: кто быстрее — он скажет ответ или ты перевернёшь карточку?",
+      "Пусть спрашивает таблицу он, а ты отвечаешь — и иногда нарочно не так. Поймал — балл ему."],
+    ["Разделите конфеты поровну на троих: всем по одной, по кругу. Сколько у каждого?",
+      "24 прищепки: разложи поровну на 2 кучки, на 3, на 4, на 6. На сколько кучек поровну не получается?",
+      "Задача наоборот: «у каждого по 4 печенья, нас трое — сколько было в пачке?» И обратно: 12 на троих."]
+  ]
+};
+
 /* =============================================================
    ЗАНЯТИЕ ДНЯ ПО СТУПЕНЯМ — для любого ребёнка (docs/metodika.md)
    Два вида занятия (S.plan):
    · «program» — программа Мирона: четыре блока PROGRAM.blocks, как было всегда;
    · «stages»  — по ступеням: разминка, чтение по ступени чтения, счёт по ступени счёта,
-     «Внимание и память». 5 + 8 + 8 + 4 = 25 минут.
+     «Внимание, память и логика». 5 + 8 + 8 + 4 = 25 минут.
    Признак: поля plan нет (все данные до этой версии, резервные копии, история Мирона) — программа;
    новая семья после знакомства — по ступеням. Выбор — в настройках (ACT.setPlan).
    В DEFAULT_STATE поля нет нарочно: у тех, кто его не выбирал, сохранённое состояние не меняется.
@@ -2745,8 +3431,19 @@ const STAGE_BLOCKS = [
   { id: "warmup", title: "Разминка: тело и глаза", minutes: 5 },
   { id: "sread", line: "read", title: "Чтение", minutes: 8 },
   { id: "scount", line: "count", title: "Счёт", minutes: 8 },
-  { id: "focus", title: "Внимание и память", minutes: 4 }
+  { id: "focus", title: "Внимание, память и логика", minutes: 4 }
 ];
+/* Четвёртый блок — по кругу из четырёх дней: Шульте, логика, Муха, логика. Логика — через день:
+   рассуждать учатся дольше, чем искать числа. День круга — номер занятия (rules.sessionIndex),
+   как у тренажёров ступени; какая из игр логики сегодня — logic-level.logicToday */
+const FOCUS_DAYS = ["schulte", "logic", "fly", "logic"];
+const FOCUS = {
+  schulte: { title: "Внимание", name: () => "Шульте" },
+  fly: { title: "Память", name: () => "Муха" },
+  logic: { title: "Логика", name: () => LOGIC_NAME[logicToday()] }
+};
+const focusToday = () => FOCUS_DAYS[sessionIndex() % FOCUS_DAYS.length];
+const focusTitle = () => { const f = FOCUS[focusToday()]; return `${f.title}: ${f.name()}`; };
 const stageMinutes = () => STAGE_BLOCKS.reduce((s, b) => s + b.minutes, 0);
 
 /* Тренажёры: какая кнопка открывает (act и data — как у карточек в screens/trainers.js),
@@ -2819,30 +3516,8 @@ function lineTrainers(line) {
 }
 const dayTrainer = line => lineTrainers(line)[0] || null;
 
-/* Что делать без экрана — коротко для родителя, по ступени */
-const OFFSCREEN = {
-  read: [
-    "Игра «Я вижу…»: «Я вижу то, что начинается на „м-м-м“». Звук тяни, букву не называй. Слоги — хлопками: «ма-ши-на».",
-    "Букву с экрана найдите в книжке, на коробке, вылепите из пластилина. Называйте звуком: «м», не «эм».",
-    "Сложите слог из двух карточек и протяните: «м-м-ма». Тянущиеся согласные — тянем, взрывные — одним толчком: «ка».",
-    "Подпишите три вещи дома карточками: «кот», «сок», «дом». Пусть найдёт и прочитает.",
-    "Перечитайте строчку слоговой таблицы, где были запинки, — ещё раз, без спешки.",
-    "Короткий текст — по предложению: прочитал — расскажи своими словами, о чём оно.",
-    "Читайте по очереди: абзац ты, абзац он. После текста — «почему?» и «что было бы, если…».",
-    "Пусть выберет книгу сам. Спросите о главном: о чём это и чем кончилось."
-  ],
-  count: [
-    "Считайте всё вокруг: ложки, ступеньки, пуговицы — касаясь каждой. «Где больше?» — на двух горстках.",
-    "Пять пальцев: сколько согнул, сколько осталось? Десять камешков — в две ладони, все способы.",
-    "Задачи на кухне: «было 5 яблок, 2 съели». Ответ — сначала в уме, потом проверить на предметах.",
-    "8 + 5: сначала до десяти (8 + 2), потом остаток (+ 3). Рамка-десятка — из коробки от яиц.",
-    "Пучки по 10 палочек и резинка: 34 — это 3 пучка и 4 палочки. Обменять пучок на 10 палочек.",
-    "Цепочки вслух на ходу: по 2, по 5, по 10. Сбился — с начала, без спешки.",
-    "Разложите 3 ряда по 4 предмета: сколько всего? Нарисуйте ряды к примеру 2 × 5.",
-    "Один столбик таблицы вслух вперемешку. Что забыл — ряды точек на бумаге.",
-    "Разделите конфеты поровну на троих: всем по одной, по кругу. Сколько у каждого?"
-  ]
-};
+/* Что делать без экрана — коротко для родителя: у ступени три задания (src/offscreen.js), по кругу по дням */
+const offscreenToday = (line, n) => { const list = OFFSCREEN[line][n] || []; return list[sessionIndex() % list.length] || ""; };
 
 /* Круг тренажёра закончен (from — как у наклеек). Идёт занятие по ступеням — отметить блок
    этой лестницы, если тренажёр из её круга на сегодня. Возвращает id отмеченного блока или null */
@@ -2850,7 +3525,7 @@ function planRound(from) {
   const t = todayISO();
   for (const b of STAGE_BLOCKS) {
     if (b.id === "warmup") continue;                       // разминку отмечает родитель
-    const froms = b.line ? lineTrainers(b.line).flatMap(id => TRAINERS[id].from) : ["schulte", "fly"];
+    const froms = b.line ? lineTrainers(b.line).flatMap(id => TRAINERS[id].from) : ["schulte", "fly", "logic"];
     if (!froms.includes(from)) continue;
     let rec = todayRecord();
     if (!rec) { rec = { d: t, done: [] }; S.sessions.push(rec); }
@@ -2874,8 +3549,9 @@ function trainerBtn(id, cls, label) {
   return `<button class="btn ${cls}" data-act="${t.act}"${data}>${label || t.name}</button>`;
 }
 
-/* Название блока для плана на главной: «Чтение: Буквы» */
+/* Название блока для плана на главной: «Чтение: Буквы», «Логика: Что лишнее?» */
 function blockTitle(b) {
+  if (b.id === "focus") return focusTitle();
   if (!b.line) return b.title;
   const id = lineTrainers(b.line)[0];
   return id ? `${b.title}: ${TRAINERS[id].name}` : `${b.title}: выбрать ступень`;
@@ -2885,7 +3561,7 @@ function blockTitle(b) {
 function homeStages(backup, stageLine, offer = "") {   // offer — плашка входной проверки (check.js), если она сейчас нужна
   const t = todayISO(), wd = weekdayOf(t), rec = todayRecord(), done = rec ? rec.done : [], allDone = done.length >= 4;
   return `
-  <h1 class="hand">${cap(WEEKDAYS[wd])}, ${humanDate(t)}</h1>
+  ${childrenBar()}<h1 class="hand">${cap(WEEKDAYS[wd])}, ${humanDate(t)}</h1>
   <p class="sub">${allDone ? "Занятие проведено." : `Занятие по ступеням на ${stageMinutes()} минут.`}</p>
   ${weekStrip()}${offer}
   ${dayStreak() > 1 ? `<p class="streak">${dayStreak()} ${plural(dayStreak(), "день", "дня", "дней")} подряд</p>` : ""}
@@ -2916,6 +3592,10 @@ function warmupPart() {
     ${exItem(PROGRAM.body[a])}${exItem(PROGRAM.body[b])}
   </section>
   <section class="part">
+    <h2 class="hand">Пальцы</h2>
+    ${exItem(FINGERS[sessionIndex() % FINGERS.length])}
+  </section>
+  <section class="part">
     <h2 class="hand">Глаза</h2>
     ${exItem(PROGRAM.eyes.pen, miniBtn("mini-pen", 60, "Таймер на 1 минуту"))}
   </section>`;
@@ -2943,21 +3623,31 @@ function linePart(b) {
     ${done ? `<p class="green">Блок отмечен — можно дальше.</p>` : `<p class="hint">Один круг — и блок отмечается сам. Закрыть экран можно в любой момент.</p>`}
     ${rest.length ? `<p class="hint">Не идёт или уже сделали — другой тренажёр этой ступени:</p><div class="tool-row">${rest.map(id => trainerBtn(id, "small")).join("")}</div>` : ""}
     <h3>Без экрана</h3>
-    <p>${OFFSCREEN[b.line][st.n]}</p>
+    <p>${offscreenToday(b.line, st.n)}</p>
   </section>`;
 }
 
-/* Внимание и память: Шульте своего размера или Муха — по очереди, до пяти минут */
+/* Внимание, память и логика: Шульте своего размера, логика, Муха, логика — по кругу (plan.FOCUS_DAYS),
+   до пяти минут. Сегодняшнее — главной кнопкой, остальное рядом: открыть можно любое */
 function focusPart() {
-  const fly = sessionIndex() % 2 === 1, last = lastSchulte(S.schulteSize), done = doneToday("focus");
-  const sch = `<button class="btn ${!fly && !done ? "primary" : ""}" data-act="openSchulte" data-size="${S.schulteSize}">Шульте ${S.schulteSize}×${S.schulteSize}</button>`;
-  const mu = `<button class="btn ${fly && !done ? "primary" : ""}" data-act="openFly">Муха: уровень ${S.flyLevel}</button>`;
+  const now = focusToday(), game = logicToday(), last = lastSchulte(S.schulteSize), done = doneToday("focus");
+  const main = id => (id === now && !done ? "primary" : "");
+  const btn = {
+    schulte: `<button class="btn ${main("schulte")}" data-act="openSchulte" data-size="${S.schulteSize}">Шульте ${S.schulteSize}×${S.schulteSize}</button>`,
+    logic: `<button class="btn ${main("logic")}" data-act="openLogic" data-g="${game}">Логика: ${LOGIC_NAME[game]}</button>`,
+    fly: `<button class="btn ${main("fly")}" data-act="openFly">Муха: уровень ${S.flyLevel}</button>`
+  };
+  const about = {
+    schulte: last ? `Шульте: последний раз ${last.sec} с, ${humanDate(last.d)}.` : "Шульте: найти числа по порядку, показывая пальцем.",
+    logic: `Логика: круг из пяти ходов, уровень ${logicLevel(game)} из ${LOGIC_LEVELS[game]}. Пусть объясняет вслух, почему так, — это важнее скорости.`,
+    fly: `Муха: ${flyLevel().about}.`
+  };
   return `<section class="part">
-    <h2 class="hand">Сегодня: ${fly ? "Муха" : "Шульте"}</h2>
-    <p class="hint">До пяти минут, по желанию: внимание и память — не вместо чтения и счёта.</p>
-    <div class="tool-row">${fly ? mu + sch : sch + mu}</div>
+    <h2 class="hand">Сегодня: ${{ schulte: "Шульте", logic: `Логика — ${LOGIC_NAME[game]}`, fly: "Муха" }[now]}</h2>
+    <p class="hint">До пяти минут, по желанию: внимание, память и логика — не вместо чтения и счёта.</p>
+    <div class="tool-row">${[now, ...["schulte", "logic", "fly"].filter(id => id !== now)].map(id => btn[id]).join("")}</div>
     ${done ? `<p class="green">Блок отмечен — можно дальше.</p>` : ""}
-    <p class="hint">${fly ? `Муха: ${flyLevel().about}.` : last ? `Шульте: последний раз ${last.sec} с, ${humanDate(last.d)}.` : "Шульте: найти числа по порядку, показывая пальцем."}</p>
+    <p class="hint">${about[now]}</p>
   </section>`;
 }
 
@@ -2986,7 +3676,7 @@ function planPart() {
   return `<section class="part" id="plan">
     <h2 class="hand">Занятие</h2>
     <div class="stage-list">
-      <button class="btn stage-opt ${st ? "picked" : ""}" data-act="setPlan" data-v="stages" aria-pressed="${st}"><b>По ступеням</b><small>${stageMinutes()} минут: разминка, тренажёр ступени чтения, тренажёр ступени счёта, внимание и память</small></button>
+      <button class="btn stage-opt ${st ? "picked" : ""}" data-act="setPlan" data-v="stages" aria-pressed="${st}"><b>По ступеням</b><small>${stageMinutes()} минут: разминка, тренажёр ступени чтения, тренажёр ступени счёта, внимание, память и логика</small></button>
       <button class="btn stage-opt ${st ? "" : "picked"}" data-act="setPlan" data-v="program" aria-pressed="${!st}"><b>По программе</b><small>30–35 минут: разминка, слоговые таблицы и тексты, лестница по числу, пятиминутка</small></button>
     </div>
     <p class="hint">История занятий, серия дней и ступени сохраняются при любом выборе.</p>
@@ -2996,7 +3686,7 @@ function planPart() {
 /* ---------- Первый запуск ---------- */
 function onboarding() {
   return `
-  <h1 class="hand big">Ступеньки</h1>
+  ${childrenBar()}<h1 class="hand big">Ступеньки</h1>
   <p class="lead">Домашние занятия с ребёнком 5–9 лет: чтение и счёт по ступеням — от первых звуков до таблицы умножения. Каждый день — 25 минут: ты ведёшь, ребёнок играет на своём экране.</p>
   ${staircase(0)}
   <label class="field"><span>Как зовут ребёнка</span><input type="text" id="nameInput" autocomplete="off" placeholder="Имя"></label>
@@ -3038,7 +3728,7 @@ function home() {
     ? `<p class="lead">Воскресенье — по программе выходной.</p><button class="btn big" data-act="startSession">Всё равно позаниматься</button>`
     : `<button class="btn primary big" data-act="startSession">${allDone ? "Открыть занятие ещё раз" : done.length ? "Продолжить занятие" : "Начать занятие"}</button>`;
   return `
-  <h1 class="hand">${cap(WEEKDAYS[wd])}, ${humanDate(t)}</h1>
+  ${childrenBar()}<h1 class="hand">${cap(WEEKDAYS[wd])}, ${humanDate(t)}</h1>
   <p class="sub">${allDone ? "Занятие проведено." : `Занятие на ${totalMinutes()} минуты.`} Неделя ${programWeek()} программы.</p>
   ${weekStrip()}${checkOffer() ? checkCallout() : ""}
   ${dayStreak() > 1 ? `<p class="streak">${dayStreak()} ${plural(dayStreak(), "день", "дня", "дней")} подряд</p>` : ""}
@@ -3573,6 +4263,17 @@ function stagePart(line) {
   }).join("")}</div>
     </details>`;
 }
+function childrenPart() {
+  const list = children(), me = S.childName || "Без имени";
+  return `<section class="part" id="children">
+    <h2 class="hand">Дети</h2>
+    ${hasSeveral() ? `<p class="hint">У каждого — свои ступени, история занятий и наклейки. Сейчас занимается: ${esc(me)}.</p>
+    <div class="tool-row">${list.map((c) => `<button class="btn${c.active ? " picked" : ""}" data-act="childPick" data-id="${c.id}" aria-pressed="${c.active}">${esc(c.name) || "Без имени"}</button>`).join("")}</div>` : `<p class="hint">Занимаются двое или трое? У каждого будут свои ступени, история занятий и наклейки.</p>`}
+    <div class="tool-row"><button class="btn" data-act="childAdd">Добавить ребёнка</button></div>
+    ${hasSeveral() ? `<p class="hint">Резервная копия — у каждого своя: «Сохранить файлом» ниже сохраняет того, кто занимается сейчас.</p>
+    <button class="btn danger" data-act="childDrop">${ui.dropArmed ? `Точно убрать? Вся история «${esc(me)}» сотрётся. Нажми ещё раз` : `Убрать «${esc(me)}» из приложения`}</button>` : ""}
+  </section>`;
+}
 function settingsView() {
   return `
   ${topbar("Настройки")}
@@ -3581,6 +4282,7 @@ function settingsView() {
     <label class="field"><span>Имя ребёнка</span><input type="text" id="nameInput" value="${esc(S.childName)}" autocomplete="off"></label>
     <button class="btn" data-act="saveName">Сохранить имя</button>
   </section>
+  ${childrenPart()}
   ${planPart()}
   <section class="part" id="stages">
     <h2 class="hand">Ступени</h2>
@@ -3621,7 +4323,7 @@ function settingsView() {
     </details>
     <button class="btn danger" data-act="reset">${ui.resetArmed ? "Точно стереть всё? Нажми ещё раз" : "Стереть все данные"}</button>
   </section>
-  <p class="hint">«Ступеньки», версия ${"1.7.4"}</p>`;
+  <p class="hint">«Ступеньки», версия ${"1.8.0"}</p>`;
 }
 
 /* =============================================================
@@ -3721,8 +4423,8 @@ const SENTENCES = [
 
 /* ---------- Тренажёры: всё, что открывается на экране, в одном месте ----------
    Ступени ребёнка известны (rules.stagesKnown) — сверху «Сейчас подходят»: тренажёры его ступеней
-   чтения и счёта (src/stages.js) и маленькая группа «Внимание и память» — Шульте своего размера
-   и Муха. Под ними альбом наклеек — он на виду при любой ступени. Остальное свёрнуто
+   чтения и счёта (src/stages.js) и маленькая группа «Внимание, память и логика» — Шульте своего
+   размера, Муха и «Логика». Под ними альбом наклеек — он на виду при любой ступени. Остальное свёрнуто
    в «Все тренажёры». Ступень неизвестна — подсказка выбрать ступени и все тренажёры подряд,
    как было до ступеней, альбом последним. */
 
@@ -3752,6 +4454,7 @@ function trainerCards() {
     tasks: card("openTasks", {}, "story", "Сколько стало?", "задачи в одно действие"),
     calc20: card("openCalc", { k: 20 }, "frame2", "Через десяток", `8 + 5 = 8 + 2 + 3, зелёных ${calcKnownCount(20, cnt)} из ${calcPool(20, cnt).length}`),
     hundred: card("openHundred", {}, "sticks", "До 100", "десятки и единицы, пучки палочек"),
+    logic: card("openLogic", {}, "logic", "Логика", "что лишнее, ряды, судоку, рассуждай"),
     division: card("openDiv", {}, "div", "Деление", `поровну и 12 : 3, зелёных ${divKnownCount()} из ${DIV_FACTS.length}`),
     soundOut: card("openSoundOut", {}, "out", "Убери звук", S.soundOutStep === 2 ? "ступень 2: последний звук" : "ступень 1: первый звук"),
     syl1: card("openSyl", { t: "t1" }, "syl", "Слоги 1", "открытые слоги"),
@@ -3764,7 +4467,7 @@ function trainerCards() {
   };
 }
 /* Все карточки подряд, когда ступени неизвестны, — в прежнем порядке */
-const ALL_ORDER = ["fly", "words", "schulte", "schulteOther", "pairs", "chain", "dots", "hidden", "count", "calc10", "tasks", "calc20", "hundred", "mult", "division", "sounds", "letters", "merge", "words3", "soundOut", "syl1", "syl2", "syl3", "syl4", "syl5", "sentences", "text", "stickers"];
+const ALL_ORDER = ["fly", "words", "schulte", "schulteOther", "logic", "pairs", "chain", "dots", "hidden", "count", "calc10", "tasks", "calc20", "hundred", "mult", "division", "sounds", "letters", "merge", "words3", "soundOut", "syl1", "syl2", "syl3", "syl4", "syl5", "sentences", "text", "stickers"];
 
 /* Группа карточек с подписью; карточек нет — подсказка вместо них (или ничего) */
 function group(title, ids, cards, empty = "") {
@@ -3836,7 +4539,7 @@ function byStages(cards) {
   ${group(`Чтение · ${stageLabel(read)}`, nowRead, cards, none)}
   ${nowRead.includes("soundOut") && read.n > 3 ? `<p class="hint">«Убери звук» — каждый день, пока в последней проверке звуков есть ошибки на «убери звук».</p>` : ""}
   ${group(`Счёт · ${stageLabel(stageOf("count"))}`, nowCount, cards, none)}
-  ${group("Внимание и память", ["schulte", "fly"], cards)}
+  ${group("Внимание, память и логика", ["schulte", "fly", "logic"], cards)}
   ${flyLevels()}
   ${group("Альбом", ["stickers"], cards)}
   <p class="hint">Ступени меняются в <button class="link" data-act="go" data-to="settings">настройках</button>.</p>
@@ -4112,7 +4815,7 @@ function weeklyView() {
 function go(to) {
   if (to === "weekly") ui.weeklyDraft = newWeeklyDraft();
   if (to !== "session") { blockTimer.stop(); miniTimer.stop(); }
-  ui.screen = to; ui.copyBox = null; ui.resetArmed = false; ui.weeklyReplace = false;
+  ui.screen = to; ui.copyBox = null; ui.resetArmed = false; ui.dropArmed = false; ui.weeklyReplace = false;
   ui.fresh = true;                      // новый экран — показываем с лёгким появлением
   render(); scrollTop();
 }
@@ -4158,7 +4861,7 @@ function closeOverlay() {
   ui.cnt = null; ui.calc = null; ui.tsk = null;
   ui.snd = null; ui.abc = null;
   ui.mrg = null; ui.wd3 = null; ui.snt = null;
-  ui.hund = null; ui.div = null;
+  ui.hund = null; ui.div = null; ui.lg = null;
   render();
 }
 
@@ -5142,7 +5845,7 @@ const marks = `<div class="tool-row center"><button class="btn small" data-act="
 const nextBtn$1 = (g, last) => (g.solved ? `<button class="btn primary big narrow" data-act="checkNext">${last ? "Готово" : "Дальше"}</button>` : "");
 const optBtn = (v, g) => `<button class="mult-opt" data-act="checkPick" data-v="${v}"${g.off.includes(v) || (g.solved && v !== g.moves[g.i].a) ? " disabled" : ""}>${v}</button>`;
 const TITLE = { syl: "Читаем слоги", words: "Читаем слова", hard: "Читаем слоги", c5: "Какое дальше?" };
-const TIP = {
+const TIP$1 = {
   syl: "Пусть прочитает слоги вслух. Все — слитно, слогом («ма», а не «м-а»): «Получилось». По буквам или с запинками — «Не получилось», тогда начнём со слогов.",
   words: "Пусть прочитает слова вслух. Целиком или по слогам, не по буквам: «Получилось». По буквам — «Не получилось», начнём со слов.",
   hard: "Трудные слоги: два согласных подряд, Я, Ё, Е, Ь, Й, ЖИ, ЧА, ЩУ. Читает без запинок — «Получилось».",
@@ -5167,11 +5870,11 @@ function probeBody(g) {
   if (p.kind === "mark" && p.id !== "text") {
     return { title: TITLE[p.id], top: kidTop("Читаем!"),
       body: `<div class="chk-read${p.id === "words" ? " words" : ""}">${g.moves.map(x => `<span>${esc(x)}</span>`).join("")}</div>`,
-      tip: TIP[p.id], extra: marks };
+      tip: TIP$1[p.id], extra: marks };
   }
   if (p.id === "text") {
     return { title: TEXT.name, top: kidTop("Читаем!"),
-      body: `<div class="snt-text chk-text">${TEXT.t.map(line => `<p>${esc(line)}</p>`).join("")}</div>`, tip: TIP.text, extra: marks };
+      body: `<div class="snt-text chk-text">${TEXT.t.map(line => `<p>${esc(line)}</p>`).join("")}</div>`, tip: TIP$1.text, extra: marks };
   }
   if (p.id === "cnt") {
     return { title: g.solved ? `${m.n} ${thingWord(m.kind, m.n)}` : `Сколько ${thingWord(m.kind, 5)}?`, win: g.solved, top: g.solved ? kidTop(say("ok"), "yay") : kidTop("Посчитай!"),
@@ -5673,6 +6376,195 @@ function renderMult() {
     foot = parentZone(`<p class="ov-tip"><span class="ov-find">${label}</span></p>`);
   }
   ov().innerHTML = `${top}<div class="ov-center mult">${body}</div>${foot}`;
+}
+
+/* ---------- Рисунки «Логики»: фигуры и значки игр (цвета — src/styles/logic.css) ----------
+   Фигура — квадрат 100 × 100: контур синей ручкой, заливка по классу c-red, c-yel, c-blu, c-lil
+   (зелёной нет: зелёный — только «получилось»). Маленькая фигура — та же, уменьшенная к центру;
+   несколько штук (таблица «форма и сколько») — рядом. Толщина линии не зависит от размера
+   (vector-effect в стилях). */
+const SHAPE_ART = {
+  circle: `<circle cx="50" cy="50" r="40"/>`,
+  square: `<rect x="13" y="13" width="74" height="74" rx="9"/>`,
+  triangle: `<path d="M50 11L92 85H8Z"/>`,
+  star: `<path d="${starPath(50, 53, 46)}"/>`,
+  heart: `<path d="M50 88C22 68 9 50 9 33C9 19 20 10 32 10C40 10 47 14 50 21C53 14 60 10 68 10C80 10 91 19 91 33C91 50 78 68 50 88Z"/>`
+};
+/* Где стоят фигуры, когда их одна, две и три: [x, y, во сколько раз меньше] */
+const SPOTS = { 1: [[50, 50, 1]], 2: [[27, 50, 0.46], [73, 50, 0.46]], 3: [[50, 27, 0.44], [26, 72, 0.44], [74, 72, 0.44]] };
+function figSVG(it) {
+  const k = it.size === "s" ? 0.55 : 1;
+  const body = (SPOTS[it.n] || SPOTS[1]).map(([x, y, s]) =>
+    `<g transform="translate(${x} ${y}) scale(${(s * k).toFixed(3)}) translate(-50 -50)">${SHAPE_ART[it.shape] || ""}</g>`).join("");
+  return `<svg class="lgf c-${it.color}" viewBox="0 0 100 100" aria-hidden="true" focusable="false">${body}</svg>`;
+}
+/* Что в клетке: картинка, число или фигура */
+const itemHTML = it => (it.w ? pictureSVG(it.w) : "num" in it ? `<b class="lg-num">${it.num}</b>` : figSVG(it));
+
+/* Значки игр на кнопках выбора: линия цветом текста кнопки */
+const ic = body => `<svg class="lg-ic" viewBox="0 0 44 44" aria-hidden="true" focusable="false">${body}</svg>`;
+const GAME_ICON = {
+  odd: ic(`<circle cx="11" cy="11" r="7"/><circle cx="33" cy="11" r="7"/><circle cx="11" cy="33" r="7"/><rect x="26" y="26" width="14" height="14" rx="2.5"/>`),
+  row: ic(`<circle cx="7.5" cy="22" r="5.5"/><rect x="16" y="16.5" width="11" height="11" rx="2"/><text x="35.5" y="28" text-anchor="middle">?</text>`),
+  matrix: ic(`<rect x="4" y="4" width="16" height="16" rx="3"/><rect x="24" y="4" width="16" height="16" rx="3"/><rect x="4" y="24" width="16" height="16" rx="3"/><text x="32" y="38" text-anchor="middle">?</text>`),
+  sudoku: ic(`<rect x="5" y="5" width="34" height="34" rx="3"/><path d="M16.3 5v34M27.7 5v34M5 16.3h34M5 27.7h34"/>`),
+  think: ic(`<path d="M6 7h32v23H21l-9 8v-8H6Z"/><text x="22" y="24.5" text-anchor="middle">?</text>`)
+};
+
+/* --- «Логика» (с 1.8.0): пять игр на рассуждение, от пяти лет до девяти ---
+   Ходы — src/logic-data.js (у каждого ровно один верный ответ), уровни — src/logic-level.js.
+   «Что лишнее?» — четыре клетки, нажать лишнюю. «Что дальше?» — ряд и «?», под ним варианты.
+   «Чего не хватает?» — таблица с пустой клеткой и варианты. «Судоку» — сетка: клетка, которую
+   пишем сейчас, — маркером; под сеткой все знаки; получилось — следующая клетка сама.
+   «Рассуждай» — задача словами (кто не читает — читает родитель) и ответы.
+   Не тот ответ — кнопка гаснет и качнётся, Галочка «Попробуй ещё!»; засчитывается с первого раза.
+   Получилось — в полосе родителя объяснение: его слова, а не экрана.
+   Круг — пять ходов (судоку — одна сетка, ход — клетка). Итог — в S.rounds: «logic-odd-2» — игра
+   и уровень, поэтому «В прошлый раз» — с кругом той же игры на том же уровне. Круг почти без
+   промахов — следующий сложнее («Следующий круг — посложнее!»), трудно — легче (об этом — только
+   родителю). Наклейка — «logic», одна в день на все игры. */
+const SHORT$2 = { odd: "что лишнее", row: "что дальше", matrix: "чего не хватает", sudoku: "судоку", think: "рассуждай" };
+const ASK = { odd: "Что тут лишнее?", row: "Что дальше?", matrix: "Чего не хватает?", sudoku: "Что в клетке?", think: "Подумай!" };
+const TIP = {
+  odd: "Три чем-то похожи, одна — нет. Пусть скажет, чем похожи: это важнее, чем угадать.",
+  row: "Пусть назовёт ряд вслух, по одной — так повтор слышно.",
+  matrix: "Смотрим по строке и по столбцу: что в них одинаковое?",
+  sudoku: "В каждой строке и в каждом столбце каждый знак — один раз. Чего не хватает клетке с маркером?",
+  sudoku4: "В строке, в столбце и в квадрате 2 × 2 каждый знак — один раз. Чего не хватает клетке с маркером?",
+  think: "Прочитай вслух, если сам ещё не читает. Не торопи: пусть объяснит, как рассуждал."
+};
+
+/* С карточки — выбор игры; из занятия (кнопка с игрой дня) — сразу круг */
+function openLogic(game) {
+  if (LOGIC_NAME[game]) { logicStart(game); return; }
+  ui.lg = { screen: "home" };
+  showOverlay(); renderLogic();
+}
+
+/* Начать круг игры на её нынешнем уровне (или на заданном — «Легче» и «Сложнее») */
+function logicStart(game, level) {
+  if (!LOGIC_NAME[game]) return;
+  const lv = level || logicLevel(game), round = logicRound(game, lv), sud = game === "sudoku";
+  ui.lg = { screen: "play", game, level: lv, turns: sud ? null : round, sud: sud ? round : null, of: sud ? round.holes.length : round.length,
+    i: 0, firstOk: 0, first: true, solved: false, off: [], moved: 0 };
+  showOverlay(); renderLogic();
+}
+
+/* Что сейчас спрашиваем: варианты и номер верного */
+function turnNow(g) {
+  if (g.game === "sudoku") { const [r, c] = g.sud.holes[g.i]; return { opts: g.sud.symbols, right: g.sud.solved[r][c] }; }
+  const t = g.turns[g.i];
+  return g.game === "odd" ? { opts: t.items, right: t.odd, why: t.why } : t;
+}
+
+/* Нажал ответ */
+function logicPick(el) {
+  const g = ui.lg, i = Number(el.dataset.i);
+  if (!g || g.screen !== "play" || g.solved || g.off.includes(i)) return;
+  if (i !== turnNow(g).right) {                              // не тот: кнопка гаснет, Галочка подсказывает
+    g.off.push(i); g.first = false;
+    el.disabled = true; flash(el, "nope"); again();
+    return;
+  }
+  if (g.first) g.firstOk++;
+  vibrate(40);
+  if (g.game === "sudoku" && g.i + 1 < g.of) { g.i++; g.first = true; g.off = []; cheer(); renderLogic(); return; }   // следующая клетка — сама
+  g.solved = true; cheer(); renderLogic();
+}
+/* «Дальше»: следующий ход или итог круга */
+function logicNext() {
+  const g = ui.lg;
+  if (!g || g.screen !== "play" || !g.solved) return;
+  if (g.game !== "sudoku" && g.i + 1 < g.of) { g.i++; g.first = true; g.solved = false; g.off = []; renderLogic(); return; }
+  logRound(`logic-${g.game}-${g.level}`, g.firstOk, g.of);
+  g.moved = logicAfterRound(g.game, g.level, g.firstOk, g.of);
+  g.screen = "end";
+  cheer("logic");
+  renderLogic();
+}
+/* «Легче» и «Сложнее» в полосе родителя: уровень игры и новый круг */
+function logicShift(d) {
+  const g = ui.lg;
+  if (!g || !LOGIC_NAME[g.game]) return;
+  const lv = Math.min(LOGIC_LEVELS[g.game], Math.max(1, logicLevel(g.game) + (d > 0 ? 1 : -1)));
+  setLogicLevel(g.game, lv);
+  logicStart(g.game, lv);
+}
+
+/* Клетка: кнопка-ответ (i — номер варианта) или просто клетка ряда и таблицы */
+const cell = (it, cls = "", at = "") => `<span class="lg-cell${cls ? " " + cls : ""}" role="img" aria-label="${itemLabel(it)}"${at}>${itemHTML(it)}</span>`;
+const ask = (at = "") => `<span class="lg-cell q" role="img" aria-label="что здесь?"${at}>?</span>`;
+function pickBtn(g, it, i, right) {
+  const won = g.solved && i === right, dead = g.off.includes(i) || (g.solved && !won);
+  return `<button class="lg-cell${won ? " ok" : ""}" data-act="lgPick" data-i="${i}" aria-label="${itemLabel(it)}"${dead ? " disabled" : ""}>${itemHTML(it)}</button>`;
+}
+const optsRow = (g, t) => `<div class="lg-opts n${t.opts.length}">${t.opts.map((it, i) => pickBtn(g, it, i, t.right)).join("")}</div>`;
+
+/* Сетка судоку: что дано, что уже вписано (зелёным), что пишем сейчас (маркером), что ещё пусто.
+   В сетке 4 × 4 между квадратами 2 × 2 — просвет: клетки стоят по своим местам (at), третья полоса сетки пустая */
+function sudokuHTML(g) {
+  const p = g.sud, n = p.n, filled = g.solved ? g.of : g.i, track = v => (n === 4 && v > 1 ? v + 2 : v + 1);
+  let html = "";
+  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) {
+    const k = p.holes.findIndex(([y, x]) => y === r && x === c), at = n === 4 ? ` style="grid-area:${track(r)} / ${track(c)}"` : "";
+    html += k < 0 ? cell(p.symbols[p.solved[r][c]], "", at) : k < filled ? cell(p.symbols[p.solved[r][c]], "got", at)
+      : k === filled ? ask(at) : `<span class="lg-cell empty" role="img" aria-label="пусто"${at}></span>`;
+  }
+  return `<div class="lg-grid sud n${n}">${html}</div>`;
+}
+
+const levelRow = g => {
+  const lv = logicLevel(g.game), max = LOGIC_LEVELS[g.game];
+  return `<div class="tool-row center"><button class="btn small" data-act="lgLevel" data-d="-1"${lv <= 1 ? " disabled" : ""}>Легче</button><button class="btn small" data-act="lgLevel" data-d="1"${lv >= max ? " disabled" : ""}>Сложнее</button></div>`;
+};
+const find = (g, lv) => `<span class="ov-find lg-find">${SHORT$2[g.game].charAt(0).toUpperCase()}${SHORT$2[g.game].slice(1)} · уровень ${lv} из ${LOGIC_LEVELS[g.game]}</span>`;
+/* Задача словами: каждое предложение — с новой строки (без «просмотра назад» в регулярке: старый Safari его не знает) */
+const lines = text => (text.match(/[^.?!]+[.?!]+/g) || [text]).map(x => `<span>${esc(x.trim())}</span>`).join("");
+
+function renderLogic() {
+  const g = ui.lg;
+  let top, body, foot;
+  if (g.screen === "home") {
+    const today = logicToday();
+    top = kidTop(hello());
+    body = `<p class="big-hand">Логика</p>
+      <div class="lg-games">${LOGIC_GAMES.map(k =>
+        `<button class="btn lg-game${k === today ? " primary" : ""}" data-act="lgStart" data-g="${k}">${GAME_ICON[k]}<b>${LOGIC_NAME[k]}</b></button>`).join("")}</div>`;
+    foot = parentZone(`<p class="ov-tip">Пять игр на рассуждение. Уровень растёт сам: круг почти без промахов — следующий сложнее, трудно — легче. Сейчас: ${
+      LOGIC_GAMES.map(k => `${SHORT$2[k]} — ${logicLevel(k)}`).join(", ")}. «Рассуждай» — задачи словами: прочитай вслух, если сам ещё не читает.</p>`);
+  } else if (g.screen === "end") {
+    const list = roundsOf(`logic-${g.game}-${g.level}`), prev = list.length > 1 ? list[list.length - 2] : null;
+    top = kidTop(say("yay"), "yay");
+    body = `${winTitle("Круг пройден!")}
+      <p class="cmp">С первого раза: ${g.firstOk} из ${g.of}.</p>
+      ${prev ? `<p class="cmp">В прошлый раз — ${prev.ok} из ${prev.of}.</p>` : ""}
+      ${g.moved > 0 ? `<p class="cmp green">Следующий круг — посложнее!</p>` : ""}
+      ${wonCard()}
+      <div class="tool-row center"><button class="btn primary" data-act="lgStart" data-g="${g.game}">Ещё круг</button><button class="btn" data-act="openLogic">Другая игра</button></div>`;
+    foot = parentZone(`<p class="ov-tip">${find(g, logicLevel(g.game))}${
+      g.moved > 0 ? "Почти без промахов — уровень вырос." : g.moved < 0 ? "Было трудно — следующий круг будет полегче." : ""}</p>`, levelRow(g));
+  } else {
+    const t = turnNow(g), sud = g.game === "sudoku", last = sud || g.i + 1 >= g.of;
+    top = g.solved ? kidTop(say("ok"), "yay") : sud && g.i > 0 ? kidTop(say("ok"), "yay") : kidTop(ASK[g.game]);
+    const next = g.solved ? `<button class="btn primary big narrow" data-act="lgNext">${last ? "Готово" : "Дальше"}</button>` : "";
+    if (g.game === "odd") {
+      body = `<div class="lg-odd">${t.opts.map((it, i) => pickBtn(g, it, i, t.right)).join("")}</div>${next}`;
+    } else if (g.game === "row") {
+      body = `<div class="lg-row">${t.row.map(it => cell(it)).join("")}${g.solved ? cell(t.opts[t.right], "got") : ask()}</div>${g.solved ? next : optsRow(g, t)}`;
+    } else if (g.game === "matrix") {
+      body = `<div class="lg-grid n${t.size}">${t.cells.map(it => (it ? cell(it) : g.solved ? cell(t.opts[t.right], "got") : ask())).join("")}</div>${g.solved ? next : optsRow(g, t)}`;
+    } else if (sud) {
+      body = `${g.solved ? winTitle("Собрано!", 4) : ""}${sudokuHTML(g)}${g.solved ? next : optsRow(g, t)}`;
+    } else {
+      body = `<p class="lg-text">${lines(t.text)}</p>
+        <div class="snt-opts">${t.opts.map((a, i) => `<button class="snt-opt${g.solved && i === t.right ? " ok" : ""}" data-act="lgPick" data-i="${i}"${
+          g.off.includes(i) || (g.solved && i !== t.right) ? " disabled" : ""}>${esc(a)}</button>`).join("")}</div>${next}`;
+    }
+    body += steps(g.i + (g.solved ? 1 : 0), g.of, sud ? `клетка ${Math.min(g.i + 1, g.of)} из ${g.of}` : `${g.i + 1} из ${g.of}`);
+    const why = g.solved && t.why ? esc(t.why) : TIP[sud && g.sud.n === 4 ? "sudoku4" : g.game];
+    foot = parentZone(`<p class="ov-tip">${find(g, g.level)}${why}</p>`, g.solved ? "" : levelRow(g));
+  }
+  ov().innerHTML = `${top}<div class="ov-center logic is-${g.screen === "play" ? g.game : g.screen}">${body}</div>${foot}`;
 }
 
 /* --- «Буквы» (ступень Ч1) ---
@@ -6329,7 +7221,7 @@ function renderSounds() {
    Открывается с карточки на экране тренажёров и с детского экрана, где дали наклейку;
    «Назад» возвращает на тот экран (ACT.stickersBack), «Готово» — закрывает. */
 const FROM = ["sch", "syl", "txt", "fly", "pairsG", "chainG", "out", "hid", "dots", "mult", "cnt", "calc", "tsk", "snd", "abc", "mrg", "wd3", "snt",
-  "hund", "div"];   // какие детские экраны бывают открыты
+  "hund", "div", "lg"];   // какие детские экраны бывают открыты
 const TILT = [-6, 4, -3, 7, -5, 3, -7, 5, -2, 6, -4, 2];   // каждая наклеена чуть криво — по-своему
 
 function openStickers() {
@@ -6839,7 +7731,7 @@ const BACK = { sch: renderSchulte, syl: renderSyl, words: renderWords, txt: rend
   chainG: renderChain, out: renderSoundOut, hid: renderHidden, dots: renderDots, mult: renderMult,
   cnt: renderCount, calc: renderCalc, tsk: renderTasks, snd: renderSounds, abc: renderLetters,
   mrg: renderMerge, wd3: renderWords3, snt: renderSentences,
-  hund: renderHundred, div: renderDiv };
+  hund: renderHundred, div: renderDiv, lg: renderLogic };
 
 const ACT = {
   go: el => go(el.dataset.to),
@@ -7024,6 +7916,11 @@ const ACT = {
   hundAns: el => hundAnswer(el),
   hundDigit: el => hundDigit(el),                          // столбиком: цифра ответа, сначала единицы
   hundNext: () => hundNext(),
+  openLogic: el => openLogic(el.dataset.g),                // «Логика»: с карточки — выбор игры, из занятия — игра дня
+  lgStart: el => logicStart(el.dataset.g),                 // что лишнее, что дальше, чего не хватает, судоку, рассуждай
+  lgPick: el => logicPick(el),
+  lgNext: () => logicNext(),
+  lgLevel: el => logicShift(Number(el.dataset.d)),         // «Легче» и «Сложнее» в полосе родителя
   openDiv: () => openDiv(),
   divShare: () => divShare(),                              // «Поровну»
   divPlate: el => divPlate(el),                            // нажал тарелку — предмет на неё
@@ -7252,6 +8149,27 @@ const ACT = {
     ui.session = null; save(); render();
   },
   setSound(el) { S.sound = el.dataset.v === "1"; save(); render(); ding(); },   // включил — сразу слышно, какой он
+  /* Несколько детей (src/children.js): занятие и детский экран прежнего ребёнка закрываются */
+  childAdd: async () => {
+    await flush(); closeOverlay();
+    await addChild();
+    ui.session = null; ui.screen = "home"; render(); scrollTop();
+  },
+  childPick: async el => {
+    await flush(); closeOverlay();
+    const ok = await pickChild(el.dataset.id);
+    if (!ok) { if (el.getAttribute("aria-pressed") !== "true") toast("Не получилось открыть данные этого ребёнка"); return; }
+    ui.session = null; ui.screen = "home"; render(); scrollTop();
+    toast(`Занимается: ${S.childName || "Без имени"}`);
+  },
+  childDrop: async () => {
+    if (!ui.dropArmed) { ui.dropArmed = true; render(); return; }
+    ui.dropArmed = false;
+    const name = await dropChild();
+    if (!name) { toast("Не получилось: данные другого ребёнка не открылись"); render(); return; }
+    ui.session = null; ui.screen = "home"; render(); scrollTop();
+    toast(`Убрали: «${name}». Занимается: ${S.childName || "Без имени"}`);
+  },
   reset() {
     if (!ui.resetArmed) { ui.resetArmed = true; render(); return; }
     replaceState(clone(DEFAULT_STATE)); ui.resetArmed = false; ui.session = null; ui.screen = "home";
@@ -7299,6 +8217,7 @@ if (location.protocol.startsWith("http") && "serviceWorker" in navigator) {
 (async function init() {
   $("#app").innerHTML = `<p class="hint">Загрузка…</p>`;
   await loadState();
+  await loadChildren();                          // есть ли ещё дети (с 1.9.0); один ребёнок — ничего не меняется
   render();
 })();</script>
   <style rel="stylesheet" crossorigin>/* Стили по разделам. ПОРЯДОК ВАЖЕН: при равной силе селекторов побеждает
@@ -7581,6 +8500,10 @@ textarea{resize:vertical;min-height:96px}
 .stage-opt{display:flex;flex-direction:column;align-items:flex-start;justify-content:flex-start;gap:2px;width:100%;text-align:left}
 .stage-opt small{font-weight:400;font-size:14px;line-height:1.35;color:var(--muted)}
 .stage-opt.picked small{color:#E6EAF4}
+
+/* Несколько детей (с 1.9.0): кто занимается — кнопки с именами над главной */
+.kids-bar{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 10px}
+.kids-bar .btn,#children .tool-row .btn{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 /* ---------- Неделя и серия на главной ---------- */
 .week{display:flex;gap:5px;margin:12px 0 4px}
 .week div{flex:1;text-align:center;font-size:12px;color:var(--muted)}
@@ -8098,6 +9021,79 @@ textarea{resize:vertical;min-height:96px}
   .chk-text{font-size:16.5px;line-height:1.3;padding:6px 12px}
   .chk-text p{margin-bottom:.2em}
 }
+/* ---------- «Логика» (с 1.8.0): что лишнее, что дальше, чего не хватает, судоку, рассуждай ----------
+   Фигуры — синей ручкой с заливкой; зелёной заливки нет: зелёный — только «получилось». */
+.lgf{display:block;width:100%;height:100%;overflow:visible}
+.lgf *{fill:var(--lf,#fff);stroke:var(--ink);stroke-width:2.6px;stroke-linejoin:round;vector-effect:non-scaling-stroke}
+.lgf.c-red{--lf:#FF7F6E}
+.lgf.c-yel{--lf:#FFD84D}
+.lgf.c-blu{--lf:#74ABFF}
+.lgf.c-lil{--lf:#BB96F5}
+.lg-num{font:700 min(7.4vw,32px)/1 var(--sans);color:var(--ink);font-variant-numeric:tabular-nums}
+
+/* выбор игры: пять кнопок, последняя — во всю ширину */
+.lg-games{display:grid;grid-template-columns:1fr 1fr;gap:10px;width:100%;max-width:400px}
+.lg-game{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;min-height:96px;padding:10px 8px;border-radius:14px;font-size:17px}
+.lg-game:last-child{grid-column:1 / -1;flex-direction:row;gap:12px;min-height:64px}
+.lg-ic{width:40px;height:40px;flex:none;fill:none;stroke:currentColor;stroke-width:2.4;stroke-linecap:round;stroke-linejoin:round}
+.lg-ic text{fill:currentColor;stroke:none;font:700 17px var(--sans)}
+
+/* клетка с фигурой, картинкой или числом: кнопка-ответ или клетка ряда и таблицы */
+.lg-cell{display:flex;align-items:center;justify-content:center;aspect-ratio:1;min-width:0;padding:11%;background:#fff;border:2.5px solid #D3DCEA;border-radius:16px;
+  box-shadow:2px 3px 0 rgba(35,64,184,.12);font:inherit;color:inherit}
+button.lg-cell{border-color:var(--ink);cursor:pointer;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+button.lg-cell:disabled{opacity:.3;cursor:default}
+button.lg-cell.ok,.lg-cell.got{border-color:var(--green);box-shadow:0 0 0 4px var(--green-soft);opacity:1}
+.lg-cell.nope{animation:nope .3s ease-in-out}
+.lg-cell.q{border-style:dashed;border-color:var(--ink);background:var(--marker);font:700 min(9vw,38px)/1 var(--hand);color:var(--ink)}
+.lg-cell.empty{background:#F4F7FC;box-shadow:none}
+
+/* «Что лишнее?» — четыре крупные клетки */
+.lg-odd{display:grid;grid-template-columns:1fr 1fr;gap:12px;width:min(100%,330px)}
+/* «Что дальше?» — ряд в одну строку на белой ленте, «?» в конце */
+.lg-row{display:flex;gap:3px;width:100%;max-width:520px;justify-content:center;padding:8px 6px;background:#fff;border-radius:16px;
+  box-shadow:0 0 0 1.5px #D3DCEA,2px 3px 0 rgba(35,64,184,.12)}
+.lg-row .lg-cell{flex:1 1 0;max-width:68px;padding:3px;border:2px solid transparent;border-radius:10px;box-shadow:none;background:none}
+.lg-row .lg-cell.q{border:2px dashed var(--ink);background:var(--marker)}
+.lg-row .lg-cell.got{border-color:var(--green);background:var(--green-soft)}
+/* варианты ответа под рядом, таблицей и сеткой */
+.lg-opts{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;width:min(100%,360px)}
+.lg-opts.n3{grid-template-columns:repeat(3,1fr);width:min(100%,290px)}
+.lg-opts .lg-cell{padding:12%}
+/* таблицы и судоку */
+.lg-grid{display:grid;gap:6px;width:min(100%,300px)}
+.lg-grid.n2{grid-template-columns:repeat(2,1fr);width:min(100%,230px)}
+.lg-grid.n3{grid-template-columns:repeat(3,1fr)}
+.lg-grid.n4{grid-template-columns:repeat(4,1fr);width:min(100%,320px)}
+.lg-grid .lg-cell{border-radius:12px;border-width:2px;box-shadow:none}
+.lg-grid.sud{gap:4px;padding:6px;background:#fff;border:2.5px solid var(--ink);border-radius:16px}
+.lg-grid.sud .lg-cell{border-radius:8px;border-color:#D3DCEA;padding:13%}
+.lg-grid.sud .lg-cell.got{border-color:var(--green);box-shadow:none;background:var(--green-soft)}
+.lg-grid.sud .lg-cell.q{border-color:var(--ink)}
+.lg-grid.sud.n4{grid-template-columns:1fr 1fr 2px 1fr 1fr;grid-template-rows:auto auto 2px auto auto}   /* просвет между квадратами 2 × 2 */
+/* «Рассуждай» — задача словами */
+.lg-text{width:min(100%,560px);padding:12px 16px;background:#fff;border-radius:16px;box-shadow:0 0 0 1.5px #D3DCEA,2px 3px 0 rgba(35,64,184,.12);
+  font:400 clamp(19px,5.4vw,25px)/1.4 var(--sans);color:var(--graphite);text-align:left}
+.lg-text span{display:block}
+.lg-text span:last-child{margin-top:.3em;font-weight:700}
+/* в полосе родителя: какая игра и уровень — своей строкой */
+.lg-find{display:block}
+
+/* низкий экран (телефон 360 × 640): всё помещается без прокрутки */
+@media (max-height:700px){
+  .lg-game{min-height:78px;font-size:16px}
+  .lg-game:last-child{min-height:56px}
+  .lg-ic{width:34px;height:34px}
+  .lg-odd{width:min(100%,264px);gap:10px}
+  .lg-grid{width:min(100%,246px)}
+  .lg-grid.n2{width:min(100%,190px)}
+  .lg-grid.n4{width:min(100%,250px)}
+  .lg-opts{width:min(100%,300px);gap:8px}
+  .lg-opts.n3{width:min(100%,236px)}
+  .lg-text{font-size:clamp(17px,5vw,21px);line-height:1.34;padding:9px 13px}
+  .logic .snt-opt{min-height:46px;padding:6px 12px}
+  .logic .snt-opts{gap:7px}
+}
 /* ---------- Детские экраны: Галочка, праздник, наклейки ----------
    Рисунки — src/kids-art.js, разметка — src/overlays/kids.js и stickers.js.
    Линии — синей ручкой (--ink), «получилось» — зелёной (--green), заливки — мягкие,
@@ -8268,6 +9264,7 @@ textarea{resize:vertical;min-height:96px}
   .mg-syl .c,.mg-syl.rev .c,.mg-arc{animation:none}
   .mg-opt.nope,.yn-btn.nope,.snt-opt.nope{animation:none;background:#F2F4F8}
   .plate.nope,.numcard.ask.nope{animation:none;background:#F2F4F8}   /* «Поровну»: тарелка ждёт; цепочка: «Ещё раз» */
+  .lg-cell.nope{animation:none;background:#F2F4F8}                   /* «Логика»: не та клетка */
 }</style>
 </head>
 <body>
