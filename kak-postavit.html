@@ -121,6 +121,16 @@ footer{margin-top:34px;color:var(--muted);font-size:14px}
     <div class="copy"><input id="addr2" readonly aria-label="Ссылка на эту страницу"><button type="button" id="copyBtn2">Скопировать</button></div>
   </section>
 
+  <!-- Android, но не Chrome (Samsung Internet, Яндекс и т. п.): там телефон может не поставить
+       или показать «Подозрительное приложение заблокировано» — ярлык собирает этот браузер, а не Chrome -->
+  <section class="card warn" id="notChrome" hidden>
+    <h3>Поставь через Chrome</h3>
+    <p>Отсюда телефон может написать «Подозрительное приложение заблокировано». Приложение безопасное, но из Chrome такого окна нет.</p>
+    <a class="btn" id="toChrome" href="#">Открыть в Chrome</a>
+    <p class="muted" style="margin-top:10px">Не открылось — скопируй ссылку и вставь её в адресную строку Chrome. Chrome нет — поставь его из Play Маркета.</p>
+    <div class="copy"><input id="addr3" readonly aria-label="Ссылка на эту страницу"><button type="button" id="copyBtn3">Скопировать</button></div>
+  </section>
+
   <!-- Chrome сам готов поставить: одна кнопка -->
   <section class="card go" id="quick" hidden>
     <h3>Можно одним нажатием</h3>
@@ -145,7 +155,7 @@ footer{margin-top:34px;color:var(--muted);font-size:14px}
     <ol class="steps">
       <li>
         <p class="say">Открой эту страницу в браузере <b>Chrome</b>.</p>
-        <p class="muted">Если пришла ссылка в мессенджере — сначала смотри жёлтую подсказку выше или раздел «Не получается?».</p>
+        <p class="muted">Именно Chrome, а не браузер Samsung или другой: из них телефон может не поставить приложение. Если пришла ссылка в мессенджере — сначала смотри жёлтую подсказку выше или раздел «Не получается?».</p>
       </li>
       <li>
         <p class="say">Нажми <b class="tap">⋮</b> — три точки в правом верхнем углу.</p>
@@ -301,6 +311,13 @@ footer{margin-top:34px;color:var(--muted);font-size:14px}
     </div>
   </details>
   <details>
+    <summary>Телефон пишет «Подозрительное приложение заблокировано»</summary>
+    <div>
+      <p>Так бывает, если ставить не из Chrome, а, например, из браузера Samsung: ярлык тогда собирает этот браузер по старым правилам Android, и защита Google на него ругается. Само приложение ничего не просит, не ходит в интернет и не видит телефон.</p>
+      <p>Нажми <b class="tap">OK</b>, открой эту страницу в Chrome и поставь оттуда — окна не будет. Можно и нажать «Всё равно установить»: работать будет так же.</p>
+    </div>
+  </details>
+  <details>
     <summary>В меню нет пункта «Установить приложение»</summary>
     <div>
       <p>Поищи «Добавить на главный экран» — это то же самое.</p>
@@ -332,7 +349,7 @@ footer{margin-top:34px;color:var(--muted);font-size:14px}
     <li>Всё хранится <b>только на этом устройстве</b>. Приложение ничего не отправляет в интернет.</li>
     <li>Раз в неделю сохраняй копию истории: Настройки → <b>«Сохранить файлом»</b>. Пригодится при смене телефона.</li>
     <li>Не очищай данные браузера и не удаляй значок — вместе с ними сотрётся история.</li>
-    <li>Одно устройство — один ребёнок. Для второго нужен свой телефон или планшет.</li>
+    <li>Детей несколько — можно на одном устройстве: Настройки → «Дети» → <b>«Добавить ребёнка»</b>. У каждого свои ступени, история и наклейки.</li>
   </ul>
 
   <footer>«Ступеньки» — ежедневные домашние занятия: чтение и счёт по ступеням, от первых звуков до таблицы умножения. <a href="index.html">Открыть приложение без установки</a></footer>
@@ -346,6 +363,9 @@ footer{margin-top:34px;color:var(--muted);font-size:14px}
   const isAndroid = /Android/.test(ua);
   const inApp = /Telegram|Instagram|FBAN|FBAV|FB_IAB|Line\/|VKClient|; wv\)/.test(ua);
   const iosOther = isIOS && /CriOS|FxiOS|EdgiOS|YaBrowser|OPiOS/.test(ua);
+  /* Android не в Chrome: у Firefox нет «Chrome/», остальные браузеры на Chromium дописывают своё имя */
+  const notChrome = isAndroid && !inApp && (!/Chrome\//.test(ua) ||
+    /SamsungBrowser|YaBrowser|YaApp|OPR\/|OPT\/|EdgA|MiuiBrowser|HuaweiBrowser|VivoBrowser|HeyTapBrowser|UCBrowser|GSA\//.test(ua));
   const standalone = (window.matchMedia && matchMedia("(display-mode: standalone)").matches) || navigator.standalone === true;
   const $ = s => document.querySelector(s);
   const show = (s, on = true) => { $(s).hidden = !on; };
@@ -363,8 +383,12 @@ footer{margin-top:34px;color:var(--muted);font-size:14px}
   show("#installed", standalone);
   show("#inapp", !standalone && inApp);
   show("#notSafari", !standalone && !inApp && iosOther);
+  show("#notChrome", !standalone && notChrome);
   const here = location.href.split("#")[0];
-  ["#addr", "#addr2"].forEach(s => { $(s).value = here; });
+  ["#addr", "#addr2", "#addr3"].forEach(s => { $(s).value = here; });
+  /* Ссылка-намерение Android: та же страница, но в Chrome. Адрес собирается здесь — в файле внешних адресов нет */
+  $("#toChrome").href = "intent://" + location.host + location.pathname +
+    "#Intent;scheme=" + location.protocol.replace(":", "") + ";package=com.android.chrome;end";
   function copy(input, btn) {
     const done = () => { btn.textContent = "Скопировано"; };
     if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(here).then(done, () => { $(input).select(); });
@@ -372,13 +396,14 @@ footer{margin-top:34px;color:var(--muted);font-size:14px}
   }
   $("#copyBtn").addEventListener("click", e => copy("#addr", e.currentTarget));
   $("#copyBtn2").addEventListener("click", e => copy("#addr2", e.currentTarget));
+  $("#copyBtn3").addEventListener("click", e => copy("#addr3", e.currentTarget));
 
   /* Chrome и Edge сами сообщают, что приложение можно поставить, — тогда хватает одной кнопки */
   let offer = null;
   window.addEventListener("beforeinstallprompt", e => {
     e.preventDefault();
     offer = e;
-    if (!standalone && !inApp) show("#quick");
+    if (!standalone && !inApp && !notChrome) show("#quick");
   });
   $("#quickBtn").addEventListener("click", async () => {
     if (!offer) return;
