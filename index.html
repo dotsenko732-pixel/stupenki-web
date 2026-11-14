@@ -4323,7 +4323,7 @@ function settingsView() {
     </details>
     <button class="btn danger" data-act="reset">${ui.resetArmed ? "Точно стереть всё? Нажми ещё раз" : "Стереть все данные"}</button>
   </section>
-  <p class="hint">«Ступеньки», версия ${"1.8.0"}</p>`;
+  <p class="hint">«Ступеньки», версия ${"1.8.1"}</p>`;
 }
 
 /* =============================================================
@@ -4847,7 +4847,7 @@ const ov = () => $("#overlay");
 /* Открыть детский экран. Каждый новый круг тренажёра открывается заново —
    наклейка прошлого круга на нём уже не показывается */
 function showOverlay() {
-  ui.won = null; ui.album = null;
+  ui.won = null; ui.lost = false; ui.album = null;
   ov().hidden = false; document.body.classList.add("ov-open");
 }
 
@@ -4857,7 +4857,7 @@ function closeOverlay() {
   if (ui.dots && ui.dots.timer) clearTimeout(ui.dots.timer);
   ov().hidden = true; ov().innerHTML = ""; ov().classList.remove("sky"); document.body.classList.remove("ov-open");
   ui.sch = null; ui.syl = null; ui.txt = null; ui.fly = null; ui.pairsG = null; ui.chainG = null; ui.out = null;
-  ui.hid = null; ui.dots = null; ui.mult = null; ui.won = null; ui.album = null;
+  ui.hid = null; ui.dots = null; ui.mult = null; ui.won = null; ui.lost = false; ui.album = null;
   ui.cnt = null; ui.calc = null; ui.tsk = null;
   ui.snd = null; ui.abc = null;
   ui.mrg = null; ui.wd3 = null; ui.snt = null;
@@ -4993,9 +4993,23 @@ function played(from) {
 }
 /* Получилось. from — тренажёр закончен: «дзынь» из трёх нот и наклейка */
 function cheer(from) {
-  ui.talk++;
+  ui.talk++; ui.lost = false;
   if (from) finished(from);
   ding(from ? "win" : "ok");
+}
+
+/* Круг с ответами закончен: ok — сколько ходов с первого раза из of.
+   Наклейка и «дзынь» — если с первого раза хотя бы половина (тот же порог, ниже которого «Логика» снижает
+   уровень). Иначе можно нажимать все ответы подряд, пока не попадёшь, и всё равно получать наклейку —
+   так и выходило до ноября 2026. Без наклейки на её месте — пустой силуэт и «Подумай, не спеши»
+   (ui.lost; только если сегодня за этот тренажёр её ещё не давали). Блок занятия отмечается в любом случае */
+const fairRound = (ok, of) => ok * 2 >= of;
+function roundEnd(from, ok, of) {
+  if (fairRound(ok, of)) { cheer(from); return true; }
+  ui.talk++;
+  ui.lost = !stickerToday(from);
+  played(from);
+  return false;
 }
 
 /* Заголовок «получилось»: зелёный, вокруг звёздочки синей ручкой */
@@ -5003,6 +5017,7 @@ const winTitle = (html, n = 5) => `<div class="cheer"><p class="big-hand win">${
 
 /* Новая наклейка в конце круга: крупно, нажал — альбом */
 function wonCard() {
+  if (ui.lost) return `<div class="sticker-win wait">${stickerSVG(nextSticker(), "ghost")}<span>Подумай, не спеши — и будет наклейка!</span></div>`;
   if (!ui.won) return "";
   const s = stickerById(ui.won.id);
   return `<button class="sticker-win" data-act="openStickers" aria-label="Новая наклейка: ${s.name}. Открыть альбом">${stickerSVG(s.id)}<span>Новая наклейка!</span></button>`;
@@ -5080,7 +5095,7 @@ function finish$4() {
   if (g.mode === "mind") g.sec = Math.max(1, Math.round((Date.now() - g.t0) / 1000));
   logRound(t, g.firstOk, g.base, g.mode === "mind" ? g.sec : undefined);
   g.screen = "end";
-  cheer(t);
+  roundEnd(t, g.firstOk, g.base);
 }
 
 /* Нажал ответ */
@@ -5242,7 +5257,7 @@ function chainNext() {
   g.shown++; vibrate(25);
   if (g.shown >= g.len) {
     logRound(chainKey(g.step, g.back), g.len - 1 - g.slips.length, g.len - 1);
-    cheer("chain");
+    roundEnd("chain", g.len - 1 - g.slips.length, g.len - 1);
   }
   renderChain();
 }
@@ -5413,7 +5428,7 @@ function countNext() {
   const g = ui.cnt;
   if (!g.solved) return;
   g.i++;
-  if (g.i >= g.turns.length) { g.end = true; logRound(g.mode, g.firstOk, ROUND$3); cheer("count"); }
+  if (g.i >= g.turns.length) { g.end = true; logRound(g.mode, g.firstOk, ROUND$3); roundEnd("count", g.firstOk, ROUND$3); }
   else newTurn$1();
   renderCount();
 }
@@ -5561,7 +5576,7 @@ function divNext() {
   if (!(g.screen === "share" || g.screen === "train") || !g.solved) return;
   g.i++;
   const list = g.screen === "share" ? g.turns : g.facts;
-  if (g.i >= list.length) { logRound(g.mode === "share" ? "share" : "div", g.firstOk, g.base); g.screen = "end"; cheer("div"); }
+  if (g.i >= list.length) { logRound(g.mode === "share" ? "share" : "div", g.firstOk, g.base); g.screen = "end"; roundEnd("div", g.firstOk, g.base); }
   else if (g.screen === "share") newTurn(); else newFact();
   renderDiv();
 }
@@ -6099,7 +6114,7 @@ function finish$3() {
   if (g.mode === "mind") g.sec = Math.max(1, Math.round((Date.now() - g.t0) / 1000));
   logRound(LOG$3[g.mode], g.firstOk, g.base, g.mode === "mind" ? g.sec : undefined);
   g.screen = "end";
-  cheer("hundred");
+  roundEnd("hundred", g.firstOk, g.base);
 }
 
 /* Нажал ответ */
@@ -6316,7 +6331,7 @@ function multNext() {
     else { g.k++; g.shown = false; }
   } else if (g.screen === "train") {
     g.i++;
-    if (g.i >= g.facts.length) { g.screen = "end"; cheer("mult"); } else newQuestion$1();
+    if (g.i >= g.facts.length) { g.screen = "end"; roundEnd("mult", g.firstOk, g.base); } else newQuestion$1();
   }
   renderMult();
 }
@@ -6479,7 +6494,7 @@ function logicNext() {
   logRound(`logic-${g.game}-${g.level}`, g.firstOk, g.of);
   g.moved = logicAfterRound(g.game, g.level, g.firstOk, g.of);
   g.screen = "end";
-  cheer("logic");
+  roundEnd("logic", g.firstOk, g.of);
   renderLogic();
 }
 /* «Легче» и «Сложнее» в полосе родителя: уровень игры и новый круг */
@@ -6659,7 +6674,7 @@ function letterNext() {
     for (const L of new Set(g.moves.map(m => m.L))) letterRecord(L, !g.miss[L]);
     save();
     logRound("letters", g.ok, g.moves.length);
-    g.screen = "end"; cheer("letters");
+    g.screen = "end"; roundEnd("letters", g.ok, g.moves.length);
   }
   renderLetters();
 }
@@ -6780,7 +6795,7 @@ function finish$2(lastOk = true) {
   const g = ui.mrg;
   g.end = true;
   logRound(LOG$2[g.mode], g.ok, g.moves.length);
-  if (lastOk) cheer("merge"); else { ui.talk++; played("merge"); }
+  if (lastOk) roundEnd("merge", g.ok, g.moves.length); else { ui.talk++; ui.lost = false; played("merge"); }
 }
 
 /* «Слияние»: родитель отметил. По буквам — ещё раз тот же слог (уже не с первого раза), потом дальше */
@@ -6942,7 +6957,7 @@ function sentNext() {
   const g = ui.snt;
   if (!g || g.screen !== "q" || !g.solved) return;
   g.q++;
-  if (g.q >= QS) { g.screen = "end"; logRound("sentences", g.ok, QS); cheer("sentences"); }
+  if (g.q >= QS) { g.screen = "end"; logRound("sentences", g.ok, QS); roundEnd("sentences", g.ok, QS); }
   else newQuestion();
   renderSentences();
 }
@@ -7048,22 +7063,23 @@ function takeOutWord() {
 }
 
 function openSoundOut() {
-  ui.out = { step: S.soundOutStep, word: takeOutWord(), removed: false, answer: false, peek: false, done: 0 };
+  ui.out = { step: S.soundOutStep, word: takeOutWord(), removed: false, answer: false, peek: false, done: 0, firstOk: 0, first: true };
   showOverlay(); renderSoundOut();
 }
 
 function nextSoundOut() {
   if (ui.out.done >= ROUND$1) { ui.out.done = 0; ui.won = null; }     // круг пройден — новый
-  Object.assign(ui.out, { word: takeOutWord(), removed: false, answer: false, peek: false });
+  if (ui.out.done === 0) ui.out.firstOk = 0;
+  Object.assign(ui.out, { word: takeOutWord(), removed: false, answer: false, peek: false, first: true });
   renderSoundOut();
 }
 
 /* Нажал фишку: нужная уходит (третье слово круга — праздник), не та — качнётся, Галочка подскажет */
 function outTap(i) {
   const o = ui.out, gone = o.step === 2 ? o.word.n - 1 : 0;
-  if (i !== gone) { again(); return false; }
-  o.removed = true; o.done++;
-  cheer(o.done >= ROUND$1 ? "out" : null);
+  if (i !== gone) { o.first = false; again(); return false; }
+  o.removed = true; o.done++; if (o.first) o.firstOk++;
+  if (o.done >= ROUND$1) roundEnd("out", o.firstOk, ROUND$1); else cheer();
   renderSoundOut();
   return true;
 }
@@ -7128,7 +7144,7 @@ function finish$1() {
   const g = ui.snd;
   g.end = true;
   logRound(LOG$1[g.mode], g.ok, g.moves.length);
-  cheer("sounds");
+  roundEnd("sounds", g.ok, g.moves.length);
 }
 
 /* Первый и последний звук: нажал картинку. Не та — качнётся и погаснет, ход уже не с первого раза */
@@ -7379,7 +7395,7 @@ function taskNext() {
   const g = ui.tsk;
   if (!g.solved) return;
   g.i++;
-  if (g.i >= g.list.length) { g.end = true; logRound("tasks", g.firstOk, ROUND); cheer("tasks"); }
+  if (g.i >= g.list.length) { g.end = true; logRound("tasks", g.firstOk, ROUND); roundEnd("tasks", g.firstOk, ROUND); }
   else newTask();
   renderTasks();
 }
@@ -7574,7 +7590,7 @@ function finish(lastOk = true) {
   const g = ui.wd3;
   g.end = true;
   logRound(LOG[g.mode], g.ok, g.moves.length);
-  if (lastOk) cheer("words3"); else { ui.talk++; played("words3"); }
+  if (lastOk) roundEnd("words3", g.ok, g.moves.length); else { ui.talk++; ui.lost = false; played("words3"); }
 }
 function solved() { const g = ui.wd3; if (g.first) g.ok++; g.solved = true; vibrate(40); cheer(); renderWords3(); }
 function missed(el, key) { const g = ui.wd3; flash(el, "nope"); el.disabled = true; g.off.push(key); g.first = false; again(); }
@@ -9165,6 +9181,10 @@ button.lg-cell.ok,.lg-cell.got{border-color:var(--green);box-shadow:0 0 0 4px va
   background:rgba(255,255,255,.75);cursor:pointer;font:inherit;color:var(--ink);touch-action:manipulation}
 .sticker-win .stk{width:60px;height:60px;transform:rotate(-6deg);animation:slap .5s .2s cubic-bezier(.2,1.4,.4,1) both}
 .sticker-win span{font-family:var(--hand);font-weight:700;font-size:26px;line-height:1.1}
+/* Наклейки нет (меньше половины с первого раза): её пустое место, без анимации, не нажимается */
+.sticker-win.wait{cursor:default;color:var(--muted)}
+.sticker-win.wait .stk{animation:none;transform:rotate(-6deg)}
+.sticker-win.wait span{font-size:22px}
 @keyframes slap{0%{transform:scale(1.9) rotate(-22deg);opacity:0}100%{transform:scale(1) rotate(-6deg);opacity:1}}
 /* Наклейка в верхней строке — у тренажёров без конца круга (слоги, мои слова) */
 .kid-stk{flex:none;width:46px;height:46px;padding:3px;border:0;background:none;cursor:pointer;touch-action:manipulation}
